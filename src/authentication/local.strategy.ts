@@ -12,7 +12,6 @@ export class LocalStrategy extends PassportStrategy(Strategy) {
 
   async validate(customerInfo: Prisma.CustomerWhereUniqueInput) {
     const customer = await this.authService.validateUser(customerInfo);
-    console.log('customer info: ', customer);
     if (!customer) {
       throw new UnauthorizedException();
     }
