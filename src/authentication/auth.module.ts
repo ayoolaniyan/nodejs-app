@@ -9,6 +9,7 @@ import { CustomerService } from 'src/customer/customer.service';
 import { LocalStrategy } from './local.strategy';
 import { RolesGuard } from './role/roles.guard';
 import { RefreshTokenStrategy } from './refresh-token.strategy';
+import { ConfigModule } from '@nestjs/config';
 
 @Module({
   imports: [
@@ -19,6 +20,7 @@ import { RefreshTokenStrategy } from './refresh-token.strategy';
         expiresIn: process.env.JWT_EXPIRES_IN,
       },
     }),
+    ConfigModule,
   ],
   controllers: [AuthController],
   providers: [

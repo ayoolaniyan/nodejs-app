@@ -2,7 +2,6 @@ import { Injectable, NotFoundException } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { CustomerService } from 'src/customer/customer.service';
 import { JwtService } from '@nestjs/jwt';
-import { WhereCustomerInput } from 'src/customer/dto/customer.input';
 
 @Injectable()
 export class AuthService {

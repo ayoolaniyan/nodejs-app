@@ -8,6 +8,7 @@ import { join } from 'path';
 import { PrismaService } from './prisma.service';
 import { CustomerModule } from './customer/customer.module';
 import { AuthModule } from './authentication/auth.module';
+import { ConfigModule } from '@nestjs/config';
 
 @Module({
   imports: [
@@ -22,6 +23,9 @@ import { AuthModule } from './authentication/auth.module';
       context: ({ request, reply }) => ({ request, reply }),
       playground: true,
       introspection: true, // TODO update this so that it's off in production;
+    }),
+    ConfigModule.forRoot({
+      isGlobal: true,
     }),
   ],
   controllers: [AppController],
