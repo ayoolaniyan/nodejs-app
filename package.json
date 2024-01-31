@@ -31,6 +31,7 @@
     "@nestjs/typeorm": "^9.0.1",
     "@prisma/client": "^5.8.1",
     "apollo-server-express": "^3.10.3",
+    "argon2": "^0.31.2",
     "class-validator": "^0.14.0",
     "graphql": "^16.6.0",
     "graphql-type-json": "^0.3.2",

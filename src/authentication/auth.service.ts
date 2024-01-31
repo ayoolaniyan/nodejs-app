@@ -1,57 +1,118 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { ForbiddenException, Injectable } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { CustomerService } from 'src/customer/customer.service';
 import { JwtService } from '@nestjs/jwt';
+import { ConfigService } from '@nestjs/config';
+import { ApiConfigService } from 'src/services/apiConfig.service';
+// import * as argon2 from 'argon2';
+
+type Tokens = {
+  access_token: string;
+  refresh_token: string;
+};
+
+type JwtPayload = {
+  email: string;
+  sub: string;
+};
 
 @Injectable()
 export class AuthService {
   constructor(
     private readonly jwtService: JwtService,
     private readonly customerService: CustomerService,
+    private configService: ConfigService,
+    private apiConfigService: ApiConfigService,
   ) {}
 
-  async validateUser(addCustomer: Prisma.CustomerWhereUniqueInput) {
-    const customer = await this.customerService.findCustomerById(addCustomer);
-    if (!customer && customer.password === addCustomer.password) {
-      const { password, ...result } = customer;
+  async validateCustomer(addCustomer: Prisma.CustomerWhereUniqueInput) {
+    const customer = await this.customerService.findCustomerEmail(addCustomer);
+    if (customer && customer.email === addCustomer.email) {
+      const { email, ...result } = customer;
       return result;
     }
     return null;
   }
 
   async signup(addCustomer: Prisma.CustomerCreateInput) {
-    const customer = this.customerService.create(addCustomer);
-    const payload = {
-      email: (await customer).email,
-      password: (await customer).password,
+    // const hashPassword = await argon2.hash((await addCustomer).password);
+    const payload: Prisma.CustomerCreateInput = {
+      email: (await addCustomer).email,
+      password: (await addCustomer).password,
     };
-    return {
-      access_token: this.jwtService.sign(payload),
-    };
+    const customer = this.customerService.create(payload);
+    const accessToken = await this.getTokens(
+      (
+        await customer
+      ).email,
+      (
+        await customer
+      ).password,
+    );
+    return accessToken;
   }
 
   async login(addCustomer: Prisma.CustomerWhereUniqueInput) {
-    const customer = this.customerService.findCustomerById(addCustomer);
+    const customer = await this.customerService.findCustomerEmail(addCustomer);
+    if (!customer) throw new ForbiddenException('Access Denied');
+
     const payload = {
-      id: (await customer).id,
-      email: (await customer).email,
-      password: (await customer).password,
+      email: customer.email,
+      sub: customer.password,
     };
-    if (!customer) {
-      throw new NotFoundException('customer not found!');
-    }
-    const access_token = this.jwtService.sign(payload);
-    // const refresh_token = this.updateRefreshToken(
-    //   payload.id,
-    //   (await customer).rfToken,
-    // );
-    // console.log('refresh_token: ', refresh_token);
-    return access_token;
+    const accessToken = await this.getTokens(
+      (
+        await customer
+      ).email,
+      (
+        await customer
+      ).password,
+    );
+    console.log('payload', payload);
+    console.log('token', accessToken);
+
+    this.jwtService.signAsync(payload);
+    return accessToken;
   }
 
-  //   async updateRefreshToken(id: string, refreshToken: string) {
-  //     await this.customerService.updateById(id, {
-  //       rfToken: refreshToken,
-  //     });
-  //   }
+  async getTokens(email: string, password: string): Promise<Tokens> {
+    const jwtPayload: JwtPayload = {
+      sub: password,
+      email: email,
+    };
+    const [at, rt] = await Promise.all([
+      this.jwtService.signAsync(jwtPayload, {
+        secret: this.configService.get('JWT_SECRET'),
+        expiresIn: this.configService.get('JWT_EXPIRES_IN'),
+      }),
+      this.jwtService.signAsync(jwtPayload, {
+        secret: this.configService.get('JWT_REFRESH_SECRET'),
+        expiresIn: this.configService.get('JWT_EXPIRES_IN'),
+      }),
+    ]);
+    return {
+      access_token: at,
+      refresh_token: rt,
+    };
+  }
+
+  async refreshTokens(email: string): Promise<Tokens> {
+    const customer = await this.customerService.findCustomerEmail({ email });
+
+    const tokens = await this.getTokens(customer.email, customer.password);
+    // await this.updateRtHash(customer.email, tokens.refresh_token);
+
+    return tokens;
+  }
+
+  // async updateRtHash(email: string, rt: string): Promise<void> {
+  //   await this.prisma.user.update({
+  //     where: {
+  //       id: userId,
+  //     },
+  //     data: {
+  //       hashedRt: hash,
+  //     },
+  //   });
+  // }
 }

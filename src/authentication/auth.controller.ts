@@ -1,41 +1,27 @@
-import {
-  Body,
-  Controller,
-  HttpStatus,
-  Post,
-  Req,
-  Res,
-  UseGuards,
-} from '@nestjs/common';
+import { Body, Controller, Post, Req, Res, UseGuards } from '@nestjs/common';
 import { AuthService } from './auth.service';
 import { Prisma } from '@prisma/client';
 import { Request, Response } from 'express';
 import { JwtAuthGuard } from './auth.gard';
-import { LocalAuthGuard } from './local-auth.guard';
-// import { LocalAuthGuard } from './local-auth.guard';
-// import { JwtAuthGuard } from './auth.gard';
 
 @Controller('auth')
 export class AuthController {
   constructor(private readonly authService: AuthService) {}
 
-  //   @UseGuards(LocalAuthGuard)
-  //   @UseGuards(JwtAuthGuard)
+  @UseGuards(JwtAuthGuard)
   @Post('login')
-  login(
+  async login(
     @Req() request: Request,
     @Res() response: Response,
     @Body() addCustomer: Prisma.CustomerWhereUniqueInput,
   ) {
     try {
-      const result = this.authService.login(addCustomer);
-      result.then((data) => {
-        console.log('controller: ', data);
-        return response.status(200).json({
-          status: 'Ok!',
-          message: 'Successfully login!',
-          access_token: data,
-        });
+      const result = await this.authService.login(addCustomer);
+      console.log('controller: ', result);
+      return response.status(200).json({
+        status: 'Ok!',
+        message: 'Successfully login!',
+        access_token: result,
       });
     } catch (error) {
       return response.status(500).json({
@@ -45,16 +31,36 @@ export class AuthController {
     }
   }
 
-  //   @UseGuards(LocalAuthGuard)
-  //   @UseGuards(JwtAuthGuard)
   @Post('signup')
-  signup(
+  async signup(
     @Req() request: Request,
     @Res() response: Response,
     @Body() addCustomer: Prisma.CustomerCreateInput,
   ) {
     try {
-      const result = this.authService.signup(addCustomer);
+      const result = await this.authService.signup(addCustomer);
+      console.log('result', result);
+      return response.status(200).json({
+        status: 'Ok!',
+        message: 'Successfully Signup!',
+        access_token: result,
+      });
+    } catch (error) {
+      return response.status(500).json({
+        status: 'Error!',
+        message: 'Internal Server Error!',
+      });
+    }
+  }
+  @Post('validate')
+  async validateUser(
+    @Req() request: Request,
+    @Res() response: Response,
+    @Body() addCustomer: Prisma.CustomerCreateInput,
+  ) {
+    try {
+      const result = await this.authService.validateCustomer(addCustomer);
+      console.log('result', result);
       return response.status(200).json({
         status: 'Ok!',
         message: 'Successfully Signup!',

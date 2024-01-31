@@ -3,16 +3,20 @@ import { AuthGuard } from '@nestjs/passport';
 import { Observable } from 'rxjs';
 
 export class JwtAuthGuard extends AuthGuard('jwt') {
+  constructor() {
+    super();
+  }
   canActivate(
     context: ExecutionContext,
   ): boolean | Promise<boolean> | Observable<boolean> {
     return super.canActivate(context);
   }
 
-  handleRequest<TUser = any>(err: any, user: any): TUser {
-    if (err || !user) {
+  handleRequest(err: any, customer: any): any {
+    console.log('iu', customer);
+    if (err || !customer) {
       throw err || new UnauthorizedException('you are not authorized!');
     }
-    return user;
+    return customer;
   }
 }

@@ -1,11 +1,15 @@
-import { Body, Injectable, Param } from '@nestjs/common';
+import { Injectable } from '@nestjs/common';
 import { PrismaService } from 'src/prisma.service';
 import { WhereCustomerInput } from './dto/customer.input';
 import { Prisma } from '@prisma/client';
+import { JwtService } from '@nestjs/jwt';
 
 @Injectable()
 export class CustomerService {
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private readonly jwtService: JwtService,
+  ) {}
   async findAll() {
     return this.prisma.customer.findMany();
   }
@@ -20,12 +24,11 @@ export class CustomerService {
   //   });
   // }
 
-  async findCustomerById(customer: Prisma.CustomerWhereUniqueInput) {
+  async findCustomerEmail(customer: Prisma.CustomerWhereUniqueInput) {
     return this.prisma.customer.findUnique({
       where: {
         email: customer.email,
         password: customer.password,
-        rfToken: customer.rfToken,
       },
     });
   }

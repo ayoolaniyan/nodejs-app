@@ -31,22 +31,22 @@ export class CustomerController {
 
   @Get('/customer')
   getCustomer(@Body() email: Prisma.CustomerWhereUniqueInput) {
-    return this.customerService.findCustomerById(email);
+    return this.customerService.findCustomerEmail(email);
   }
 
   @Get('/customer/rfToken')
   getCustomerRfToken(@Body() rfToken: Prisma.CustomerWhereUniqueInput) {
-    return this.customerService.findCustomerById(rfToken);
+    return this.customerService.findCustomerEmail(rfToken);
   }
 
-  @Roles(Role.ADMIN)
+  @Roles(Role.USER)
   @UseGuards(RolesGuard)
   @Patch(':id')
   updateCustomer(@Param('id') id: string, @Body() data: WhereCustomerInput) {
     return this.customerService.updateById(id, data);
   }
 
-  @Roles(Role.ADMIN)
+  @Roles(Role.USER)
   @UseGuards(RolesGuard)
   @Delete(':id')
   deleteCustomer(@Param() id: Prisma.CustomerWhereUniqueInput) {
