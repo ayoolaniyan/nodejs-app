@@ -3,7 +3,6 @@ import { Prisma } from '@prisma/client';
 import { CustomerService } from 'src/customer/customer.service';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
-import { ApiConfigService } from 'src/services/apiConfig.service';
 // import * as argon2 from 'argon2';
 
 type Tokens = {
@@ -22,7 +21,6 @@ export class AuthService {
     private readonly jwtService: JwtService,
     private readonly customerService: CustomerService,
     private configService: ConfigService,
-    private apiConfigService: ApiConfigService,
   ) {}
 
   async validateCustomer(addCustomer: Prisma.CustomerWhereUniqueInput) {
@@ -40,7 +38,11 @@ export class AuthService {
       email: (await addCustomer).email,
       password: (await addCustomer).password,
     };
-    const customer = this.customerService.create(payload);
+    const customer = await this.customerService
+      .create(payload)
+      .catch((error) => {
+        throw error || new ForbiddenException('Access Denied');
+      });
     const accessToken = await this.getTokens(
       (
         await customer
@@ -53,8 +55,11 @@ export class AuthService {
   }
 
   async login(addCustomer: Prisma.CustomerWhereUniqueInput) {
-    const customer = await this.customerService.findCustomerEmail(addCustomer);
-    if (!customer) throw new ForbiddenException('Access Denied');
+    const customer = await this.customerService
+      .findCustomerEmail(addCustomer)
+      .catch((error) => {
+        throw error || new ForbiddenException('Access Denied');
+      });
 
     const payload = {
       email: customer.email,
@@ -100,19 +105,7 @@ export class AuthService {
     const customer = await this.customerService.findCustomerEmail({ email });
 
     const tokens = await this.getTokens(customer.email, customer.password);
-    // await this.updateRtHash(customer.email, tokens.refresh_token);
 
     return tokens;
   }
-
-  // async updateRtHash(email: string, rt: string): Promise<void> {
-  //   await this.prisma.user.update({
-  //     where: {
-  //       id: userId,
-  //     },
-  //     data: {
-  //       hashedRt: hash,
-  //     },
-  //   });
-  // }
 }

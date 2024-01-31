@@ -1,8 +1,9 @@
-import { Injectable } from '@nestjs/common';
+import { ForbiddenException, Injectable } from '@nestjs/common';
 import { PrismaService } from 'src/prisma.service';
 import { WhereCustomerInput } from './dto/customer.input';
 import { Prisma } from '@prisma/client';
 import { JwtService } from '@nestjs/jwt';
+import { PrismaClientKnownRequestError } from '@prisma/client/runtime/library';
 
 @Injectable()
 export class CustomerService {
@@ -10,8 +11,15 @@ export class CustomerService {
     private prisma: PrismaService,
     private readonly jwtService: JwtService,
   ) {}
+
   async findAll() {
-    return this.prisma.customer.findMany();
+    const result = this.prisma.customer.findMany().catch((error) => {
+      if (error instanceof PrismaClientKnownRequestError) {
+        throw new ForbiddenException('Credentials incorrect');
+      }
+      throw error;
+    });
+    return result;
   }
   // async findAll(params: GetCustomerInput) {
   //   const { skip, take, cursor, where } = params;
@@ -25,30 +33,61 @@ export class CustomerService {
   // }
 
   async findCustomerEmail(customer: Prisma.CustomerWhereUniqueInput) {
-    return this.prisma.customer.findUnique({
-      where: {
-        email: customer.email,
-        password: customer.password,
-      },
-    });
+    const result = this.prisma.customer
+      .findUnique({
+        where: {
+          email: customer.email,
+          password: customer.password,
+        },
+      })
+      .catch((error) => {
+        if (error instanceof PrismaClientKnownRequestError) {
+          throw new ForbiddenException('Credentials incorrect');
+        }
+        throw error;
+      });
+    return result;
   }
 
   async create(addCustomer: Prisma.CustomerCreateInput) {
-    return this.prisma.customer.create({
+    const result = this.prisma.customer.create({
       data: addCustomer,
     });
+    // .catch((error) => {
+    //   if (error instanceof PrismaClientKnownRequestError) {
+    //     throw new ForbiddenException('Could not create account');
+    //   }
+    //   throw error;
+    // });
+    return result;
   }
 
   async updateById(id: string, updateCustomer: WhereCustomerInput) {
-    return this.prisma.customer.update({
-      where: { id: id },
-      data: updateCustomer,
-    });
+    const result = this.prisma.customer
+      .update({
+        where: { id: id },
+        data: updateCustomer,
+      })
+      .catch((error) => {
+        if (error instanceof PrismaClientKnownRequestError) {
+          throw new ForbiddenException('Credentials incorrect');
+        }
+        throw error;
+      });
+    return result;
   }
 
   async deleteById(id: Prisma.CustomerWhereUniqueInput) {
-    return this.prisma.customer.delete({
-      where: id,
-    });
+    const result = this.prisma.customer
+      .delete({
+        where: id,
+      })
+      .catch((error) => {
+        if (error instanceof PrismaClientKnownRequestError) {
+          throw new ForbiddenException('Credentials incorrect');
+        }
+        throw error;
+      });
+    return result;
   }
 }

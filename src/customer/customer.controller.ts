@@ -34,11 +34,6 @@ export class CustomerController {
     return this.customerService.findCustomerEmail(email);
   }
 
-  @Get('/customer/rfToken')
-  getCustomerRfToken(@Body() rfToken: Prisma.CustomerWhereUniqueInput) {
-    return this.customerService.findCustomerEmail(rfToken);
-  }
-
   @Roles(Role.USER)
   @UseGuards(RolesGuard)
   @Patch(':id')
