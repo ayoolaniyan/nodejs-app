@@ -3,7 +3,7 @@ import { Prisma } from '@prisma/client';
 import { CustomerService } from 'src/customer/customer.service';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
-// import * as argon2 from 'argon2';
+import * as argon2 from 'argon2';
 
 type Tokens = {
   access_token: string;
@@ -33,10 +33,10 @@ export class AuthService {
   }
 
   async signup(addCustomer: Prisma.CustomerCreateInput) {
-    // const hashPassword = await argon2.hash((await addCustomer).password);
+    const hashPassword = await argon2.hash((await addCustomer).password);
     const payload: Prisma.CustomerCreateInput = {
       email: (await addCustomer).email,
-      password: (await addCustomer).password,
+      password: hashPassword,
     };
     const customer = await this.customerService
       .create(payload)
@@ -55,16 +55,22 @@ export class AuthService {
   }
 
   async login(addCustomer: Prisma.CustomerWhereUniqueInput) {
-    const customer = await this.customerService
-      .findCustomerEmail(addCustomer)
-      .catch((error) => {
-        throw error || new ForbiddenException('Access Denied');
-      });
+    const customer = await this.customerService.findCustomerEmail(addCustomer);
+
+    console.log('customer', customer);
 
     const payload = {
       email: customer.email,
       sub: customer.password,
     };
+
+    const passwordMatches = await argon2.verify(
+      customer.password,
+      addCustomer.password.toString(),
+    );
+
+    if (!passwordMatches) throw new ForbiddenException('Access Denied');
+
     const accessToken = await this.getTokens(
       (
         await customer
@@ -73,7 +79,6 @@ export class AuthService {
         await customer
       ).password,
     );
-    console.log('payload', payload);
     console.log('token', accessToken);
 
     this.jwtService.signAsync(payload);

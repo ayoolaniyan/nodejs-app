@@ -41,8 +41,8 @@ export class CustomerController {
     return this.customerService.updateById(id, data);
   }
 
-  @Roles(Role.USER)
-  @UseGuards(RolesGuard)
+  // @Roles(Role.USER)
+  // @UseGuards(RolesGuard)
   @Delete(':id')
   deleteCustomer(@Param() id: Prisma.CustomerWhereUniqueInput) {
     return this.customerService.deleteById(id);

@@ -33,32 +33,17 @@ export class CustomerService {
   // }
 
   async findCustomerEmail(customer: Prisma.CustomerWhereUniqueInput) {
-    const result = this.prisma.customer
-      .findUnique({
-        where: {
-          email: customer.email,
-          password: customer.password,
-        },
-      })
-      .catch((error) => {
-        if (error instanceof PrismaClientKnownRequestError) {
-          throw new ForbiddenException('Credentials incorrect');
-        }
-        throw error;
-      });
-    return result;
+    return this.prisma.customer.findUnique({
+      where: {
+        email: customer.email,
+      },
+    });
   }
 
   async create(addCustomer: Prisma.CustomerCreateInput) {
     const result = this.prisma.customer.create({
       data: addCustomer,
     });
-    // .catch((error) => {
-    //   if (error instanceof PrismaClientKnownRequestError) {
-    //     throw new ForbiddenException('Could not create account');
-    //   }
-    //   throw error;
-    // });
     return result;
   }
 
