@@ -1,32 +1,40 @@
 import { NestFactory } from '@nestjs/core';
+import { ConfigService } from '@nestjs/config';
+import { ValidationPipe } from '@nestjs/common';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { AppModule } from './app.module';
-// import { PrismaService } from './prisma.service';
 
 async function bootstrap() {
-  process.env.DATABASE_URL = `postgresql://${process.env.DB_USER}:${process.env.DB_PASSWORD}@${process.env.DB_HOST}:${process.env.DB_PORT}/${process.env.DB_DATABASE}?schema=${process.env.DB_SCHEMA}&sslmode=prefer`;
-  process.env.SHADOW_DATABASE_URL = `postgresql://${process.env.DB_USER}:${process.env.DB_PASSWORD}@${process.env.DB_HOST}:${process.env.DB_PORT}/${process.env.DB_DATABASE}?schema=dbmigration&sslmode=prefer`;
+  const app = await NestFactory.create(AppModule, { cors: true });
+  const config = app.get(ConfigService);
 
-  const app = await NestFactory.create(AppModule, {
-    bufferLogs: true,
-    cors: true,
-  });
-  // app.useLogger(app.get(PinoLogger));
-  // const prismaService = app.get(PrismaService);
-  // await prismaService.enableShutdownHooks(app);
+  app.useGlobalPipes(
+    new ValidationPipe({
+      // Strip properties that have no matching DTO field, and reject the
+      // request if any were sent, so clients cannot smuggle extra columns
+      // (a `role` of their choosing, for instance) into a write.
+      whitelist: true,
+      forbidNonWhitelisted: true,
+      transform: true,
+    }),
+  );
+
+  if (config.get('NODE_ENV') !== 'production') {
+    const swaggerConfig = new DocumentBuilder()
+      .setTitle('Customer API')
+      .setDescription('REST and GraphQL API for customer records')
+      .setVersion('1.0')
+      .addBearerAuth()
+      .build();
+    SwaggerModule.setup(
+      'api',
+      app,
+      SwaggerModule.createDocument(app, swaggerConfig),
+    );
+  }
+
   app.enableShutdownHooks();
-  const config = new DocumentBuilder()
-    .setTitle('Service Example')
-    .setDescription('Service that can be used for boiler plating')
-    .setVersion('1.0')
-    .addTag('example')
-    .addTag('default')
-    .addBearerAuth()
-    .build();
-  const document = SwaggerModule.createDocument(app, config);
-  SwaggerModule.setup('api', app, document);
-
-  await app.startAllMicroservices();
-  await app.listen(8080);
+  await app.listen(config.get<number>('PORT') ?? 8080);
 }
+
 bootstrap();

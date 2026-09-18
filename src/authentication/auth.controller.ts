@@ -1,76 +1,45 @@
-import { Body, Controller, Post, Req, Res, UseGuards } from '@nestjs/common';
-import { AuthService } from './auth.service';
-import { Prisma } from '@prisma/client';
-import { Request, Response } from 'express';
-import { JwtAuthGuard } from './auth.gard';
+import {
+  Body,
+  Controller,
+  Get,
+  HttpCode,
+  HttpStatus,
+  Post,
+  Req,
+  UseGuards,
+} from '@nestjs/common';
+import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
+import { Request } from 'express';
+import { AuthService, Tokens } from './auth.service';
+import { JwtAuthGuard } from './jwt-auth.guard';
+import { LoginDto, SignupDto } from './dto/auth.dto';
 
+@ApiTags('auth')
 @Controller('auth')
 export class AuthController {
   constructor(private readonly authService: AuthService) {}
 
-  @UseGuards(JwtAuthGuard)
-  @Post('login')
-  async login(
-    @Req() request: Request,
-    @Res() response: Response,
-    @Body() addCustomer: Prisma.CustomerWhereUniqueInput,
-  ) {
-    try {
-      const result = await this.authService.login(addCustomer);
-      console.log('controller: ', result);
-      return response.status(200).json({
-        status: 'Ok!',
-        message: 'Successfully login!',
-        access_token: result,
-      });
-    } catch (error) {
-      return response.status(500).json({
-        status: 'Error!',
-        message: 'Internal Server Error!',
-      });
-    }
+  /**
+   * Public by design — requiring a token to obtain a token would make login
+   * impossible.
+   */
+  @Post('signup')
+  @HttpCode(HttpStatus.CREATED)
+  signup(@Body() body: SignupDto): Promise<Tokens> {
+    return this.authService.signup(body);
   }
 
-  @Post('signup')
-  async signup(
-    @Req() request: Request,
-    @Res() response: Response,
-    @Body() addCustomer: Prisma.CustomerCreateInput,
-  ) {
-    try {
-      const result = await this.authService.signup(addCustomer);
-      console.log('result', result);
-      return response.status(200).json({
-        status: 'Ok!',
-        message: 'Successfully Signup!',
-        access_token: result,
-      });
-    } catch (error) {
-      return response.status(500).json({
-        status: 'Error!',
-        message: 'Internal Server Error!',
-      });
-    }
+  @Post('login')
+  @HttpCode(HttpStatus.OK)
+  login(@Body() body: LoginDto): Promise<Tokens> {
+    return this.authService.login(body);
   }
-  @Post('validate')
-  async validateUser(
-    @Req() request: Request,
-    @Res() response: Response,
-    @Body() addCustomer: Prisma.CustomerCreateInput,
-  ) {
-    try {
-      const result = await this.authService.validateCustomer(addCustomer);
-      console.log('result', result);
-      return response.status(200).json({
-        status: 'Ok!',
-        message: 'Successfully Signup!',
-        access_token: result,
-      });
-    } catch (error) {
-      return response.status(500).json({
-        status: 'Error!',
-        message: 'Internal Server Error!',
-      });
-    }
+
+  /** Returns the customer behind the presented access token. */
+  @ApiBearerAuth()
+  @UseGuards(JwtAuthGuard)
+  @Get('me')
+  me(@Req() request: Request) {
+    return request.user;
   }
 }

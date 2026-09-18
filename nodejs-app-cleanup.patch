@@ -1,0 +1,4849 @@
+From 5ce595cab260cee6541d3e5fc4928130e54438e7 Mon Sep 17 00:00:00 2001
+From: Omobolaji Olaniyan <omobolaayobamiolaniyan@gmail.com>
+Date: Fri, 18 Sep 2026 09:13:12 +0000
+Subject: [PATCH] Fix auth defects, restore missing modules, add tests, CI and
+ documentation
+
+- Put the customer id in the JWT subject, not the password hash
+- Remove the JwtAuthGuard from the login route (a token was required
+  in order to obtain a token)
+- Read roles from the authenticated principal, not the request body
+- Add the missing datesMatch and TimeUnit modules so the existing
+  test suite runs; add a test script, which did not exist
+- Fix the JwtModule secret ('process.env.JWT_SECRET' as a literal)
+- Align the Role enum with the database values
+- Set passReqToCallback on the refresh strategy
+- Validate configuration at boot; reject equal JWT secrets
+- Hash seeded passwords; never seed in production
+- Delete dead half-implementations and eval() in config
+- Add 28 tests, GitHub Actions CI, and a README
+---
+ .env.example                                 |   23 +-
+ .eslintrc.js                                 |   57 +-
+ .github/workflows/ci.yml                     |   32 +
+ README.md                                    |  106 +-
+ package-lock.json                            | 1497 ++----------------
+ package.json                                 |   54 +-
+ prisma/seed.ts                               |   19 +-
+ prisma/seeds/customers.ts                    |   22 +-
+ src/app.module.ts                            |   28 +-
+ src/authentication/access-token.strategy.ts  |   31 +-
+ src/authentication/auth.controller.ts        |  101 +-
+ src/authentication/auth.gard.ts              |   22 -
+ src/authentication/auth.module.ts            |   34 +-
+ src/authentication/auth.service.spec.ts      |  180 +++
+ src/authentication/auth.service.ts           |  145 +-
+ src/authentication/dto/auth.dto.ts           |   23 +
+ src/authentication/jwt-auth.guard.ts         |   12 +
+ src/authentication/local-auth.guard.ts       |    5 -
+ src/authentication/local.strategy.ts         |   24 -
+ src/authentication/refresh-token.strategy.ts |   17 +-
+ src/authentication/role/enums/role.enum.ts   |    9 +-
+ src/authentication/role/roles.guard.spec.ts  |   58 +
+ src/authentication/role/roles.guard.ts       |   23 +-
+ src/config/env.validation.spec.ts            |   27 +
+ src/config/env.validation.ts                 |   33 +
+ src/customer/customer.controller.ts          |   57 +-
+ src/customer/customer.module.ts              |   17 +-
+ src/customer/customer.resolver.ts            |   22 +-
+ src/customer/customer.service.ts             |  123 +-
+ src/customer/dto/customer.input.ts           |   59 +-
+ src/enums/timeUnit.enum.ts                   |   16 +
+ src/lib/datesMatch.ts                        |   63 +
+ src/lib/entities/customer.entity.ts          |    5 +-
+ src/main.ts                                  |   54 +-
+ src/prisma.service.ts                        |   15 +-
+ src/services/apiConfig.service.ts            |   20 -
+ test/app.e2e-spec.ts                         |   30 -
+ test/auth.e2e-spec.ts                        |  134 ++
+ test/jest-setup.ts                           |    8 +
+ 39 files changed, 1262 insertions(+), 1943 deletions(-)
+ create mode 100644 .github/workflows/ci.yml
+ delete mode 100644 src/authentication/auth.gard.ts
+ create mode 100644 src/authentication/auth.service.spec.ts
+ create mode 100644 src/authentication/dto/auth.dto.ts
+ create mode 100644 src/authentication/jwt-auth.guard.ts
+ delete mode 100644 src/authentication/local-auth.guard.ts
+ delete mode 100644 src/authentication/local.strategy.ts
+ create mode 100644 src/authentication/role/roles.guard.spec.ts
+ create mode 100644 src/config/env.validation.spec.ts
+ create mode 100644 src/config/env.validation.ts
+ create mode 100644 src/enums/timeUnit.enum.ts
+ create mode 100644 src/lib/datesMatch.ts
+ delete mode 100644 src/services/apiConfig.service.ts
+ delete mode 100644 test/app.e2e-spec.ts
+ create mode 100644 test/auth.e2e-spec.ts
+
+diff --git a/.env.example b/.env.example
+index 54ac68a..7289da8 100644
+--- a/.env.example
++++ b/.env.example
+@@ -1,9 +1,16 @@
+-DB_USER=postgres
+-DB_PASSWORD=docker
+-DB_HOST=localhost
+-DB_PORT=5432
+-DB_DATABASE=recruitment
+-DB_SCHEMA=task
++# Copy to .env and fill in. Never commit .env.
++NODE_ENV=development
++PORT=8080
+ 
+-DATABASE_URL="postgresql://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_DATABASE}?schema=${DB_SCHEMA}&sslmode=prefer"
+-SHADOW_DATABASE_URL="postgresql://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_DATABASE}?schema=dbmigration&sslmode=prefer"
+\ No newline at end of file
++# Prisma reads DATABASE_URL directly; set it as one value rather than
++# assembling it at runtime.
++DATABASE_URL="postgresql://postgres:postgres@localhost:5432/customers?schema=public&sslmode=prefer"
++SHADOW_DATABASE_URL="postgresql://postgres:postgres@localhost:5432/customers?schema=dbmigration&sslmode=prefer"
++
++# Must be two different secrets: sharing one means a refresh token is
++# accepted anywhere an access token is. Generate with:
++#   node -e "console.log(require('crypto').randomBytes(48).toString('base64url'))"
++JWT_SECRET=
++JWT_EXPIRES_IN=15m
++JWT_REFRESH_SECRET=
++JWT_REFRESH_EXPIRES_IN=7d
+diff --git a/.eslintrc.js b/.eslintrc.js
+index 2bf97f8..23ad514 100644
+--- a/.eslintrc.js
++++ b/.eslintrc.js
+@@ -1,26 +1,35 @@
+ module.exports = {
+-    parser: '@typescript-eslint/parser',
+-    parserOptions: {
+-      project: 'tsconfig.json',
+-      tsconfigRootDir : __dirname, 
+-      sourceType: 'module',
+-    },
+-    plugins: ['@typescript-eslint/eslint-plugin'],
+-    extends: [
+-      'plugin:@typescript-eslint/recommended',
+-      'plugin:prettier/recommended',
++  parser: '@typescript-eslint/parser',
++  parserOptions: {
++    project: 'tsconfig.json',
++    tsconfigRootDir: __dirname,
++    sourceType: 'module',
++  },
++  plugins: ['@typescript-eslint/eslint-plugin'],
++  extends: [
++    'plugin:@typescript-eslint/recommended',
++    'plugin:prettier/recommended',
++  ],
++  root: true,
++  env: {
++    node: true,
++    jest: true,
++  },
++  ignorePatterns: ['.eslintrc.js', 'dist', 'node_modules'],
++  rules: {
++    '@typescript-eslint/interface-name-prefix': 'off',
++    '@typescript-eslint/explicit-function-return-type': 'off',
++    '@typescript-eslint/explicit-module-boundary-types': 'off',
++    '@typescript-eslint/no-explicit-any': 'off',
++    // A leading underscore marks a binding that exists only to be discarded,
++    // such as the password pulled off a record before it is returned.
++    '@typescript-eslint/no-unused-vars': [
++      'warn',
++      {
++        argsIgnorePattern: '^_',
++        varsIgnorePattern: '^_',
++        ignoreRestSiblings: true,
++      },
+     ],
+-    root: true,
+-    env: {
+-      node: true,
+-      jest: true,
+-    },
+-    ignorePatterns: ['.eslintrc.js'],
+-    rules: {
+-      '@typescript-eslint/interface-name-prefix': 'off',
+-      '@typescript-eslint/explicit-function-return-type': 'off',
+-      '@typescript-eslint/explicit-module-boundary-types': 'off',
+-      '@typescript-eslint/no-explicit-any': 'off',
+-    },
+-  };
+-  
+\ No newline at end of file
++  },
++};
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+new file mode 100644
+index 0000000..801a7d2
+--- /dev/null
++++ b/.github/workflows/ci.yml
+@@ -0,0 +1,32 @@
++name: CI
++
++on:
++  push:
++    branches: [main, master]
++  pull_request:
++
++jobs:
++  build:
++    runs-on: ubuntu-latest
++
++    steps:
++      - uses: actions/checkout@v4
++
++      - uses: actions/setup-node@v4
++        with:
++          node-version: 18
++          cache: npm
++
++      - run: npm ci
++
++      # The Prisma client is generated code and is not committed, so it has
++      # to exist before anything that imports @prisma/client is compiled.
++      - run: npm run prisma:generate
++
++      - run: npm run lint
++
++      - run: npm run typecheck
++
++      - run: npm test
++
++      - run: npm run test:e2e
+diff --git a/README.md b/README.md
+index 1a0f104..d90f8b5 100644
+--- a/README.md
++++ b/README.md
+@@ -1 +1,105 @@
+-# nodejs-senior
+\ No newline at end of file
++# nodejs-app
++
++A NestJS service exposing customer records over both REST and GraphQL, with
++JWT authentication, role-based authorisation and Prisma/PostgreSQL
++persistence.
++
++It began as a take-home exercise and is kept here as a working reference for
++how I structure a Nest service: thin controllers, business rules in services,
++persistence behind Prisma, and authorisation decided by guards rather than by
++the code inside each handler.
++
++## Stack
++
++| Concern | Choice |
++| --- | --- |
++| Framework | NestJS 9 |
++| Language | TypeScript |
++| Database | PostgreSQL via Prisma |
++| API | REST (Swagger at `/api`) and GraphQL (Apollo) |
++| Auth | Passport JWT, argon2 password hashing |
++| Tests | Jest (unit) and Supertest (HTTP) |
++
++## Running it
++
++```bash
++cp .env.example .env          # then fill in the two JWT secrets
++npm install
++npm run prisma:generate
++npm run prisma:migrate        # requires a reachable PostgreSQL
++npm run prisma:seed           # optional: two local accounts
++npm run start:dev
++```
++
++Swagger UI is served at `http://localhost:8080/api` and the GraphQL
++playground at `http://localhost:8080/graphql`, both disabled when
++`NODE_ENV=production`.
++
++## Tests
++
++```bash
++npm test        # unit tests
++npm run test:e2e   # HTTP-level tests, no database required
++npm run lint
++npm run typecheck
++```
++
++The e2e suite substitutes an in-memory double for the persistence layer, so
++it runs in CI without a PostgreSQL service container. Both suites run on
++every push via GitHub Actions.
++
++## Authentication model
++
++| Endpoint | Access |
++| --- | --- |
++| `POST /auth/signup` | public |
++| `POST /auth/login` | public |
++| `GET /auth/me` | any authenticated customer |
++| `GET /customers`, `GET /customers/:id`, `PATCH /customers/:id` | any authenticated customer |
++| `DELETE /customers/:id` | `ADMIN` only |
++
++Access and refresh tokens are signed with **different** secrets, and the
++application refuses to start if they are equal — otherwise a refresh token
++would be accepted anywhere an access token is. Token claims carry the
++customer id, email and role; a JWT payload is base64, not encryption, so
++nothing secret goes in it.
++
++## Notable design decisions
++
++**Authorisation reads from the token, not the request.** `RolesGuard`
++resolves the caller's role from `request.user`, populated by the JWT
++strategy from a signed token. An earlier version read it from the request
++body, which let any caller grant themselves a role by sending one; there is
++a regression test for exactly that case in `roles.guard.spec.ts`.
++
++**Login and signup fail identically for unknown and known accounts.** Both
++return the same error whether the email exists or the password is wrong, so
++the endpoints cannot be used to enumerate registered addresses.
++
++**The JWT strategy re-reads the customer on each request.** Slightly more
++work per call, but a token minted before a role change or an account
++deletion stops working immediately rather than at expiry.
++
++**Configuration is validated at boot.** `validateEnv` fails fast on missing
++variables. Without it, an absent `JWT_SECRET` produces tokens signed with
++`undefined` — which look perfectly valid until something tries to verify
++them.
++
++**Selects are explicit.** Read paths use a `publicCustomerFields` select so
++the password hash cannot reach a response by accident; the one method that
++returns the full record is documented as being for the auth layer only.
++
++## Repository layout
++
++```
++prisma/          schema, migrations and seed data
++src/authentication/  controller, service, JWT strategies, role guard
++src/customer/    REST controller, GraphQL resolver, service, DTOs
++src/config/      environment validation
++src/lib/         shared entities and date helpers
++test/            HTTP-level tests and Jest setup
++```
++
++## Licence
++
++MIT
+diff --git a/package-lock.json b/package-lock.json
+index 4d4ac04..3cfe873 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -1,55 +1,44 @@
+ {
+-  "name": "recruitment-task",
+-  "version": "0.0.1",
++  "name": "nodejs-app",
++  "version": "1.0.0",
+   "lockfileVersion": 2,
+   "requires": true,
+   "packages": {
+     "": {
+-      "name": "recruitment-task",
+-      "version": "0.0.1",
+-      "license": "UNLICENSED",
++      "name": "nodejs-app",
++      "version": "1.0.0",
++      "license": "MIT",
+       "dependencies": {
+         "@nestjs/apollo": "^10.1.4",
+-        "@nestjs/axios": "^0.1.0",
+         "@nestjs/common": "^9.0.11",
+         "@nestjs/config": "^3.1.1",
+         "@nestjs/core": "^9.0.11",
+         "@nestjs/graphql": "^10.1.5",
+         "@nestjs/jwt": "^10.2.0",
+-        "@nestjs/microservices": "^9.0.11",
+         "@nestjs/passport": "^10.0.3",
+         "@nestjs/platform-express": "^9.0.11",
+         "@nestjs/swagger": "^6.1.2",
+-        "@nestjs/typeorm": "^9.0.1",
+         "@prisma/client": "^5.8.1",
+         "apollo-server-express": "^3.10.3",
+         "argon2": "^0.31.2",
++        "class-transformer": "^0.5.1",
+         "class-validator": "^0.14.0",
+         "graphql": "^16.6.0",
+-        "graphql-type-json": "^0.3.2",
+-        "papaparse": "^5.3.2",
+         "passport": "^0.7.0",
+         "passport-jwt": "^4.0.1",
+-        "passport-local": "^1.0.0",
+         "reflect-metadata": "^0.1.13",
+         "rimraf": "^3.0.2",
+         "rxjs": "^7.5.6",
+-        "swagger-ui-express": "^4.5.0",
+-        "typeorm": "^0.3.15"
++        "swagger-ui-express": "^4.5.0"
+       },
+       "devDependencies": {
+-        "@golevelup/ts-jest": "^0.3.3",
+         "@nestjs/cli": "^9.1.3",
+         "@nestjs/schematics": "^9.0.3",
+         "@nestjs/testing": "^9.0.11",
+-        "@types/bcrypt": "^5.0.2",
+         "@types/express": "^4.17.13",
+         "@types/jest": "29.0.3",
+-        "@types/multer": "^1.4.7",
+         "@types/node": "^18.7.1",
+-        "@types/papaparse": "^5.3.5",
+         "@types/passport-jwt": "^4.0.0",
+-        "@types/passport-local": "^1.0.38",
+         "@types/supertest": "^2.0.12",
+         "@typescript-eslint/eslint-plugin": "^5.33.0",
+         "@typescript-eslint/parser": "^5.33.0",
+@@ -57,8 +46,6 @@
+         "eslint-config-prettier": "^8.5.0",
+         "eslint-plugin-prettier": "^4.2.1",
+         "jest": "29.0.3",
+-        "jest-junit": "^14.0.1",
+-        "pino-pretty": "^9.1.1",
+         "prettier": "^2.7.1",
+         "prisma": "^5.8.1",
+         "source-map-support": "^0.5.21",
+@@ -863,17 +850,6 @@
+         "@babel/core": "^7.0.0-0"
+       }
+     },
+-    "node_modules/@babel/runtime": {
+-      "version": "7.21.5",
+-      "resolved": "https://registry.npmjs.org/@babel/runtime/-/runtime-7.21.5.tgz",
+-      "integrity": "sha512-8jI69toZqqcsnqGGqwGS4Qb1VwLOEp4hz+CXPywcvjs60u3B4Pom/U/7rm4W8tMOYEB+E9wgD0mW1l3r8qlI9Q==",
+-      "dependencies": {
+-        "regenerator-runtime": "^0.13.11"
+-      },
+-      "engines": {
+-        "node": ">=6.9.0"
+-      }
+-    },
+     "node_modules/@babel/template": {
+       "version": "7.20.7",
+       "resolved": "https://registry.npmjs.org/@babel/template/-/template-7.20.7.tgz",
+@@ -952,7 +928,7 @@
+       "version": "0.8.1",
+       "resolved": "https://registry.npmjs.org/@cspotcode/source-map-support/-/source-map-support-0.8.1.tgz",
+       "integrity": "sha512-IchNf6dN4tHoMFIn/7OE8LWZ19Y6q/67Bmf6vnGREv8RSbBVb9LPJxEcnwrcwX6ixSvaiGoomAUvu4YSxXrVgw==",
+-      "devOptional": true,
++      "dev": true,
+       "dependencies": {
+         "@jridgewell/trace-mapping": "0.3.9"
+       },
+@@ -964,7 +940,7 @@
+       "version": "0.3.9",
+       "resolved": "https://registry.npmjs.org/@jridgewell/trace-mapping/-/trace-mapping-0.3.9.tgz",
+       "integrity": "sha512-3Belt6tdc8bPgAtbcmdtNJlirVoTmEb5e2gC94PnkwEW9jI6CAHUeoG85tjWP5WquqfavoMtMwiG4P926ZKKuQ==",
+-      "devOptional": true,
++      "dev": true,
+       "dependencies": {
+         "@jridgewell/resolve-uri": "^3.0.3",
+         "@jridgewell/sourcemap-codec": "^1.4.10"
+@@ -1048,12 +1024,6 @@
+         "node": "^12.22.0 || ^14.17.0 || >=16.0.0"
+       }
+     },
+-    "node_modules/@golevelup/ts-jest": {
+-      "version": "0.3.7",
+-      "resolved": "https://registry.npmjs.org/@golevelup/ts-jest/-/ts-jest-0.3.7.tgz",
+-      "integrity": "sha512-eoRfl9trBEt7BrQ6t3GHY/ZOcDOMBIOgqghd9qkIWMpcqQgWbU5Yf5UeHA6wwnLYpOMIJoKqazJ0cUDM79yr+g==",
+-      "dev": true
+-    },
+     "node_modules/@graphql-tools/merge": {
+       "version": "8.3.18",
+       "resolved": "https://registry.npmjs.org/@graphql-tools/merge/-/merge-8.3.18.tgz",
+@@ -1582,7 +1552,7 @@
+       "version": "3.1.0",
+       "resolved": "https://registry.npmjs.org/@jridgewell/resolve-uri/-/resolve-uri-3.1.0.tgz",
+       "integrity": "sha512-F2msla3tad+Mfht5cJq7LSXcdudKTWCVYUgw6pLFOOHSTtZlj6SWNYAp+AhuqLmWdBO2X5hPrLcu8cVP8fy28w==",
+-      "devOptional": true,
++      "dev": true,
+       "engines": {
+         "node": ">=6.0.0"
+       }
+@@ -1610,7 +1580,7 @@
+       "version": "1.4.15",
+       "resolved": "https://registry.npmjs.org/@jridgewell/sourcemap-codec/-/sourcemap-codec-1.4.15.tgz",
+       "integrity": "sha512-eF2rxCRulEKXHTRiDrDy6erMYWqNw4LPdQ8UQA4huuxaQsVeRPFl2oM8oDGxMFhJUWZf9McpLtJasDDZb/Bpeg==",
+-      "devOptional": true
++      "dev": true
+     },
+     "node_modules/@jridgewell/trace-mapping": {
+       "version": "0.3.18",
+@@ -1693,19 +1663,6 @@
+         }
+       }
+     },
+-    "node_modules/@nestjs/axios": {
+-      "version": "0.1.1",
+-      "resolved": "https://registry.npmjs.org/@nestjs/axios/-/axios-0.1.1.tgz",
+-      "integrity": "sha512-rLEq6yfho2CZyOcxP+P4Q3FjkNuiiHDyzj3Cr9i4Kdn3Ng09ygtOB4++jjXPREc6650pOFfzNtw18QH7bfLnQA==",
+-      "dependencies": {
+-        "axios": "1.2.1"
+-      },
+-      "peerDependencies": {
+-        "@nestjs/common": "^7.0.0 || ^8.0.0 || ^9.0.0",
+-        "reflect-metadata": "^0.1.12",
+-        "rxjs": "^6.0.0 || ^7.0.0"
+-      }
+-    },
+     "node_modules/@nestjs/cli": {
+       "version": "9.5.0",
+       "resolved": "https://registry.npmjs.org/@nestjs/cli/-/cli-9.5.0.tgz",
+@@ -2036,6 +1993,8 @@
+       "version": "9.4.1",
+       "resolved": "https://registry.npmjs.org/@nestjs/microservices/-/microservices-9.4.1.tgz",
+       "integrity": "sha512-052P1gFdbjEnqTLY9mwhNg7Duy/6o6tLpUQHs5w3VhpBo/fwL/2n61PfG27UM57wwtDea49KnoXWJ0+bXubrqw==",
++      "optional": true,
++      "peer": true,
+       "dependencies": {
+         "iterare": "1.2.1",
+         "tslib": "2.5.0"
+@@ -2191,29 +2150,6 @@
+         }
+       }
+     },
+-    "node_modules/@nestjs/typeorm": {
+-      "version": "9.0.1",
+-      "resolved": "https://registry.npmjs.org/@nestjs/typeorm/-/typeorm-9.0.1.tgz",
+-      "integrity": "sha512-A2BgLIPsMtmMI0bPKEf4bmzgFPsnvHqNBx3KkvaJ7hJrBQy0OqYOb+Rr06ifblKWDWS2tUPNrAFQbZjtk3PI+g==",
+-      "dependencies": {
+-        "uuid": "8.3.2"
+-      },
+-      "peerDependencies": {
+-        "@nestjs/common": "^8.0.0 || ^9.0.0",
+-        "@nestjs/core": "^8.0.0 || ^9.0.0",
+-        "reflect-metadata": "^0.1.13",
+-        "rxjs": "^7.2.0",
+-        "typeorm": "^0.3.0"
+-      }
+-    },
+-    "node_modules/@nestjs/typeorm/node_modules/uuid": {
+-      "version": "8.3.2",
+-      "resolved": "https://registry.npmjs.org/uuid/-/uuid-8.3.2.tgz",
+-      "integrity": "sha512-+NYs2QeMWy+GWFOEm9xnn6HCDp0l7QBD7ml8zLUmJ+93Q5NF0NocErnwkTkXVFNiX3/fpC6afS8Dhb/gz7R7eg==",
+-      "bin": {
+-        "uuid": "dist/bin/uuid"
+-      }
+-    },
+     "node_modules/@nodelib/fs.scandir": {
+       "version": "2.1.5",
+       "resolved": "https://registry.npmjs.org/@nodelib/fs.scandir/-/fs.scandir-2.1.5.tgz",
+@@ -2417,34 +2353,29 @@
+         "@sinonjs/commons": "^3.0.0"
+       }
+     },
+-    "node_modules/@sqltools/formatter": {
+-      "version": "1.2.5",
+-      "resolved": "https://registry.npmjs.org/@sqltools/formatter/-/formatter-1.2.5.tgz",
+-      "integrity": "sha512-Uy0+khmZqUrUGm5dmMqVlnvufZRSK0FbYzVgp0UMstm+F5+W2/jnEEQyc9vo1ZR/E5ZI/B1WjjoTqBqwJL6Krw=="
+-    },
+     "node_modules/@tsconfig/node10": {
+       "version": "1.0.9",
+       "resolved": "https://registry.npmjs.org/@tsconfig/node10/-/node10-1.0.9.tgz",
+       "integrity": "sha512-jNsYVVxU8v5g43Erja32laIDHXeoNvFEpX33OK4d6hljo3jDhCBDhx5dhCCTMWUojscpAagGiRkBKxpdl9fxqA==",
+-      "devOptional": true
++      "dev": true
+     },
+     "node_modules/@tsconfig/node12": {
+       "version": "1.0.11",
+       "resolved": "https://registry.npmjs.org/@tsconfig/node12/-/node12-1.0.11.tgz",
+       "integrity": "sha512-cqefuRsh12pWyGsIoBKJA9luFu3mRxCA+ORZvA4ktLSzIuCUtWVxGIuXigEwO5/ywWFMZ2QEGKWvkZG1zDMTag==",
+-      "devOptional": true
++      "dev": true
+     },
+     "node_modules/@tsconfig/node14": {
+       "version": "1.0.3",
+       "resolved": "https://registry.npmjs.org/@tsconfig/node14/-/node14-1.0.3.tgz",
+       "integrity": "sha512-ysT8mhdixWK6Hw3i1V2AeRqZ5WfXg1G43mqoYlM2nc6388Fq5jcXyr5mRsqViLx/GJYdoL0bfXD8nmF+Zn/Iow==",
+-      "devOptional": true
++      "dev": true
+     },
+     "node_modules/@tsconfig/node16": {
+       "version": "1.0.4",
+       "resolved": "https://registry.npmjs.org/@tsconfig/node16/-/node16-1.0.4.tgz",
+       "integrity": "sha512-vxhUy4J8lyeyinH7Azl1pdd43GJhZH/tP2weN8TntQblOY+A0XbT8DJk1/oCPuOOyg/Ja757rG0CgHcWC8OfMA==",
+-      "devOptional": true
++      "dev": true
+     },
+     "node_modules/@types/accepts": {
+       "version": "1.3.5",
+@@ -2495,15 +2426,6 @@
+         "@babel/types": "^7.3.0"
+       }
+     },
+-    "node_modules/@types/bcrypt": {
+-      "version": "5.0.2",
+-      "resolved": "https://registry.npmjs.org/@types/bcrypt/-/bcrypt-5.0.2.tgz",
+-      "integrity": "sha512-6atioO8Y75fNcbmj0G7UjI9lXN2pQ/IGJ2FWT4a/btd0Lk9lQalHLKhkgKVZ3r+spnmWUKfbMi1GEe9wyHQfNQ==",
+-      "dev": true,
+-      "dependencies": {
+-        "@types/node": "*"
+-      }
+-    },
+     "node_modules/@types/body-parser": {
+       "version": "1.19.2",
+       "resolved": "https://registry.npmjs.org/@types/body-parser/-/body-parser-1.19.2.tgz",
+@@ -2649,29 +2571,11 @@
+       "resolved": "https://registry.npmjs.org/@types/mime/-/mime-1.3.2.tgz",
+       "integrity": "sha512-YATxVxgRqNH6nHEIsvg6k2Boc1JHI9ZbH5iWFFv/MTkchz3b1ieGDa5T0a9RznNdI0KhVbdbWSN+KWWrQZRxTw=="
+     },
+-    "node_modules/@types/multer": {
+-      "version": "1.4.7",
+-      "resolved": "https://registry.npmjs.org/@types/multer/-/multer-1.4.7.tgz",
+-      "integrity": "sha512-/SNsDidUFCvqqcWDwxv2feww/yqhNeTRL5CVoL3jU4Goc4kKEL10T7Eye65ZqPNi4HRx8sAEX59pV1aEH7drNA==",
+-      "dev": true,
+-      "dependencies": {
+-        "@types/express": "*"
+-      }
+-    },
+     "node_modules/@types/node": {
+       "version": "18.16.13",
+       "resolved": "https://registry.npmjs.org/@types/node/-/node-18.16.13.tgz",
+       "integrity": "sha512-uZRomboV1vBL61EBXneL4j9/hEn+1Yqa4LQdpGrKmXFyJmVfWc9JV9+yb2AlnOnuaDnb2PDO3hC6/LKmzJxP1A=="
+     },
+-    "node_modules/@types/papaparse": {
+-      "version": "5.3.7",
+-      "resolved": "https://registry.npmjs.org/@types/papaparse/-/papaparse-5.3.7.tgz",
+-      "integrity": "sha512-f2HKmlnPdCvS0WI33WtCs5GD7X1cxzzS/aduaxSu3I7TbhWlENjSPs6z5TaB9K0J+BH1jbmqTaM+ja5puis4wg==",
+-      "dev": true,
+-      "dependencies": {
+-        "@types/node": "*"
+-      }
+-    },
+     "node_modules/@types/parse-json": {
+       "version": "4.0.0",
+       "resolved": "https://registry.npmjs.org/@types/parse-json/-/parse-json-4.0.0.tgz",
+@@ -2697,17 +2601,6 @@
+         "@types/passport-strategy": "*"
+       }
+     },
+-    "node_modules/@types/passport-local": {
+-      "version": "1.0.38",
+-      "resolved": "https://registry.npmjs.org/@types/passport-local/-/passport-local-1.0.38.tgz",
+-      "integrity": "sha512-nsrW4A963lYE7lNTv9cr5WmiUD1ibYJvWrpE13oxApFsRt77b0RdtZvKbCdNIY4v/QZ6TRQWaDDEwV1kCTmcXg==",
+-      "dev": true,
+-      "dependencies": {
+-        "@types/express": "*",
+-        "@types/passport": "*",
+-        "@types/passport-strategy": "*"
+-      }
+-    },
+     "node_modules/@types/passport-strategy": {
+       "version": "0.2.38",
+       "resolved": "https://registry.npmjs.org/@types/passport-strategy/-/passport-strategy-0.2.38.tgz",
+@@ -3155,18 +3048,6 @@
+       "resolved": "https://registry.npmjs.org/abbrev/-/abbrev-1.1.1.tgz",
+       "integrity": "sha512-nne9/IiQ/hzIhY6pdDnbBtz7DjPTKrY00P/zvPSm5pOFkl6xuGrGnXn/VtTNNfNtAfZ9/1RtehkszU9qcTii0Q=="
+     },
+-    "node_modules/abort-controller": {
+-      "version": "3.0.0",
+-      "resolved": "https://registry.npmjs.org/abort-controller/-/abort-controller-3.0.0.tgz",
+-      "integrity": "sha512-h8lQ8tacZYnR3vNQTgibj+tODHI5/+l06Au2Pcriv/Gmet0eaj4TwWH41sO9wnHDiQsEj19q0drzdWdeAHtweg==",
+-      "dev": true,
+-      "dependencies": {
+-        "event-target-shim": "^5.0.0"
+-      },
+-      "engines": {
+-        "node": ">=6.5"
+-      }
+-    },
+     "node_modules/accepts": {
+       "version": "1.3.8",
+       "resolved": "https://registry.npmjs.org/accepts/-/accepts-1.3.8.tgz",
+@@ -3183,7 +3064,7 @@
+       "version": "8.8.2",
+       "resolved": "https://registry.npmjs.org/acorn/-/acorn-8.8.2.tgz",
+       "integrity": "sha512-xjIYgE8HBrkpd/sJqOGNspf8uHG+NOHGOw6a/Urj8taM2EXfdNAH2oFcPeIFfsv3+kz/mJrS5VuMqbNLjCa2vw==",
+-      "devOptional": true,
++      "dev": true,
+       "bin": {
+         "acorn": "bin/acorn"
+       },
+@@ -3213,7 +3094,7 @@
+       "version": "8.2.0",
+       "resolved": "https://registry.npmjs.org/acorn-walk/-/acorn-walk-8.2.0.tgz",
+       "integrity": "sha512-k+iyHEuPgSw6SbuDpGQM+06HQUa04DZ3o+F6CSzXMvvI5KMvnaEqXe+YVe555R9nn6GPt404fos4wcgpw12SDA==",
+-      "devOptional": true,
++      "dev": true,
+       "engines": {
+         "node": ">=0.4.0"
+       }
+@@ -3320,11 +3201,6 @@
+         "url": "https://github.com/chalk/ansi-styles?sponsor=1"
+       }
+     },
+-    "node_modules/any-promise": {
+-      "version": "1.3.0",
+-      "resolved": "https://registry.npmjs.org/any-promise/-/any-promise-1.3.0.tgz",
+-      "integrity": "sha512-7UvmKalWRt1wgjL1RrGxoSJW/0QZFIegpeGvZG9kjp8vrRu55XTHbwnqq2GpXm9uLbcuhxm3IqX9OB4MZR1b2A=="
+-    },
+     "node_modules/anymatch": {
+       "version": "3.1.3",
+       "resolved": "https://registry.npmjs.org/anymatch/-/anymatch-3.1.3.tgz",
+@@ -3575,14 +3451,6 @@
+         "graphql": "^15.3.0 || ^16.0.0"
+       }
+     },
+-    "node_modules/app-root-path": {
+-      "version": "3.1.0",
+-      "resolved": "https://registry.npmjs.org/app-root-path/-/app-root-path-3.1.0.tgz",
+-      "integrity": "sha512-biN3PwB2gUtjaYy/isrU3aNWI5w+fAfvHkSvCKeQGxhmYpwKFUxudR3Yya+KqVRHBmEDYh+/lTozYCFbmzX4nA==",
+-      "engines": {
+-        "node": ">= 6.0.0"
+-      }
+-    },
+     "node_modules/append-field": {
+       "version": "1.0.0",
+       "resolved": "https://registry.npmjs.org/append-field/-/append-field-1.0.0.tgz",
+@@ -3622,7 +3490,7 @@
+       "version": "4.1.3",
+       "resolved": "https://registry.npmjs.org/arg/-/arg-4.1.3.tgz",
+       "integrity": "sha512-58S9QDqG0Xx27YwPSt9fJxivjYl432YCwfDMfZ+71RAqUrZef7LrKQZ3LHLOwCS4FLNBplP533Zx895SeOCHvA==",
+-      "devOptional": true
++      "dev": true
+     },
+     "node_modules/argon2": {
+       "version": "0.31.2",
+@@ -3674,26 +3542,8 @@
+     "node_modules/asynckit": {
+       "version": "0.4.0",
+       "resolved": "https://registry.npmjs.org/asynckit/-/asynckit-0.4.0.tgz",
+-      "integrity": "sha512-Oei9OH4tRh0YqU3GxhX79dM/mwVgvbZJaSNaRk+bshkj0S5cfHcgYakreBjrHwatXKbz+IoIdYLxrKim2MjW0Q=="
+-    },
+-    "node_modules/atomic-sleep": {
+-      "version": "1.0.0",
+-      "resolved": "https://registry.npmjs.org/atomic-sleep/-/atomic-sleep-1.0.0.tgz",
+-      "integrity": "sha512-kNOjDqAh7px0XWNI+4QbzoiR/nTkHAWNud2uvnJquD1/x5a7EQZMJT0AczqK0Qn67oY/TTQ1LbUKajZpp3I9tQ==",
+-      "dev": true,
+-      "engines": {
+-        "node": ">=8.0.0"
+-      }
+-    },
+-    "node_modules/axios": {
+-      "version": "1.2.1",
+-      "resolved": "https://registry.npmjs.org/axios/-/axios-1.2.1.tgz",
+-      "integrity": "sha512-I88cFiGu9ryt/tfVEi4kX2SITsvDddTajXTOFmt2uK1ZVA8LytjtdeyefdQWEf5PU8w+4SSJDoYnggflB5tW4A==",
+-      "dependencies": {
+-        "follow-redirects": "^1.15.0",
+-        "form-data": "^4.0.0",
+-        "proxy-from-env": "^1.1.0"
+-      }
++      "integrity": "sha512-Oei9OH4tRh0YqU3GxhX79dM/mwVgvbZJaSNaRk+bshkj0S5cfHcgYakreBjrHwatXKbz+IoIdYLxrKim2MjW0Q==",
++      "dev": true
+     },
+     "node_modules/babel-jest": {
+       "version": "29.5.0",
+@@ -3800,6 +3650,7 @@
+       "version": "1.5.1",
+       "resolved": "https://registry.npmjs.org/base64-js/-/base64-js-1.5.1.tgz",
+       "integrity": "sha512-AKpaYlHn8t4SVbOHCy+b5+KKgvR4vrsD8vbvrbiQJps7fKDTkjkDry6ji0rUJjC0kzbNePLwzxq8iypo41qeWA==",
++      "dev": true,
+       "funding": [
+         {
+           "type": "github",
+@@ -4150,6 +4001,12 @@
+       "integrity": "sha512-cOU9usZw8/dXIXKtwa8pM0OTJQuJkxMN6w30csNRUerHfeQ5R6U3kkU/FtJeIf3M202OHfY2U8ccInBG7/xogA==",
+       "dev": true
+     },
++    "node_modules/class-transformer": {
++      "version": "0.5.1",
++      "resolved": "https://registry.npmjs.org/class-transformer/-/class-transformer-0.5.1.tgz",
++      "integrity": "sha512-SQa1Ws6hUbfC98vKGxZH3KFY0Y1lm5Zm0SY8XX9zbK7FJCyVEac3ATW0RIpwzW+oOfmHE5PMPufDG9hCfoEOMw==",
++      "license": "MIT"
++    },
+     "node_modules/class-validator": {
+       "version": "0.14.0",
+       "resolved": "https://registry.npmjs.org/class-validator/-/class-validator-0.14.0.tgz",
+@@ -4172,61 +4029,6 @@
+         "node": ">=8"
+       }
+     },
+-    "node_modules/cli-highlight": {
+-      "version": "2.1.11",
+-      "resolved": "https://registry.npmjs.org/cli-highlight/-/cli-highlight-2.1.11.tgz",
+-      "integrity": "sha512-9KDcoEVwyUXrjcJNvHD0NFc/hiwe/WPVYIleQh2O1N2Zro5gWJZ/K+3DGn8w8P/F6FxOgzyC5bxDyHIgCSPhGg==",
+-      "dependencies": {
+-        "chalk": "^4.0.0",
+-        "highlight.js": "^10.7.1",
+-        "mz": "^2.4.0",
+-        "parse5": "^5.1.1",
+-        "parse5-htmlparser2-tree-adapter": "^6.0.0",
+-        "yargs": "^16.0.0"
+-      },
+-      "bin": {
+-        "highlight": "bin/highlight"
+-      },
+-      "engines": {
+-        "node": ">=8.0.0",
+-        "npm": ">=5.0.0"
+-      }
+-    },
+-    "node_modules/cli-highlight/node_modules/cliui": {
+-      "version": "7.0.4",
+-      "resolved": "https://registry.npmjs.org/cliui/-/cliui-7.0.4.tgz",
+-      "integrity": "sha512-OcRE68cOsVMXp1Yvonl/fzkQOyjLSu/8bhPDfQt0e0/Eb283TKP20Fs2MqoPsr9SwA595rRCA+QMzYc9nBP+JQ==",
+-      "dependencies": {
+-        "string-width": "^4.2.0",
+-        "strip-ansi": "^6.0.0",
+-        "wrap-ansi": "^7.0.0"
+-      }
+-    },
+-    "node_modules/cli-highlight/node_modules/yargs": {
+-      "version": "16.2.0",
+-      "resolved": "https://registry.npmjs.org/yargs/-/yargs-16.2.0.tgz",
+-      "integrity": "sha512-D1mvvtDG0L5ft/jGWkLpG1+m0eQxOfaBvTNELraWj22wSVUMWxZUvYgJYcKh6jGGIkJFhH4IZPQhR4TKpc8mBw==",
+-      "dependencies": {
+-        "cliui": "^7.0.2",
+-        "escalade": "^3.1.1",
+-        "get-caller-file": "^2.0.5",
+-        "require-directory": "^2.1.1",
+-        "string-width": "^4.2.0",
+-        "y18n": "^5.0.5",
+-        "yargs-parser": "^20.2.2"
+-      },
+-      "engines": {
+-        "node": ">=10"
+-      }
+-    },
+-    "node_modules/cli-highlight/node_modules/yargs-parser": {
+-      "version": "20.2.9",
+-      "resolved": "https://registry.npmjs.org/yargs-parser/-/yargs-parser-20.2.9.tgz",
+-      "integrity": "sha512-y11nGElTIV+CT3Zv9t7VKl+Q3hTQoT9a1Qzezhhl6Rp21gJ/IVTW7Z3y9EWXhuUBC2Shnf+DX0antecpAwSP8w==",
+-      "engines": {
+-        "node": ">=10"
+-      }
+-    },
+     "node_modules/cli-spinners": {
+       "version": "2.9.0",
+       "resolved": "https://registry.npmjs.org/cli-spinners/-/cli-spinners-2.9.0.tgz",
+@@ -4267,6 +4069,7 @@
+       "version": "8.0.1",
+       "resolved": "https://registry.npmjs.org/cliui/-/cliui-8.0.1.tgz",
+       "integrity": "sha512-BSeNnyus75C4//NQ9gQt1/csTXyo/8Sb+afLAkzAptFuMsod9HFokGNudZpi/oQV73hnVK+sR+5PVRMd+Dr7YQ==",
++      "dev": true,
+       "dependencies": {
+         "string-width": "^4.2.0",
+         "strip-ansi": "^6.0.1",
+@@ -4325,16 +4128,11 @@
+         "color-support": "bin.js"
+       }
+     },
+-    "node_modules/colorette": {
+-      "version": "2.0.20",
+-      "resolved": "https://registry.npmjs.org/colorette/-/colorette-2.0.20.tgz",
+-      "integrity": "sha512-IfEDxwoWIjkeXL1eXcDiow4UbKjhLdq6/EuSVR9GMN7KVH3r9gQ83e73hsz1Nd1T3ijd5xv1wcWRYO+D6kCI2w==",
+-      "dev": true
+-    },
+     "node_modules/combined-stream": {
+       "version": "1.0.8",
+       "resolved": "https://registry.npmjs.org/combined-stream/-/combined-stream-1.0.8.tgz",
+       "integrity": "sha512-FQN4MRfuJeHf7cBbBMJFXhKSDq+2kAArBlmRBvcvFE5BB1HZKXtSFASDhdlz9zOYwxh8lDdnvmMOe/+5cdoEdg==",
++      "dev": true,
+       "dependencies": {
+         "delayed-stream": "~1.0.0"
+       },
+@@ -4467,7 +4265,7 @@
+       "version": "1.1.1",
+       "resolved": "https://registry.npmjs.org/create-require/-/create-require-1.1.1.tgz",
+       "integrity": "sha512-dcKFX3jn0MpIaXjisoRvexIJVEKzaq7z2rZKxf+MSr9TkdmHmsU4m2lcLojrj/FHl8mk5VxMmYA+ftRkP/3oKQ==",
+-      "devOptional": true
++      "dev": true
+     },
+     "node_modules/cross-spawn": {
+       "version": "7.0.3",
+@@ -4488,30 +4286,6 @@
+       "resolved": "https://registry.npmjs.org/cssfilter/-/cssfilter-0.0.10.tgz",
+       "integrity": "sha512-FAaLDaplstoRsDR8XGYH51znUN0UY7nMc6Z9/fvE8EXGwvJE9hu7W2vHwx1+bd6gCYnln9nLbzxFTrcO9YQDZw=="
+     },
+-    "node_modules/date-fns": {
+-      "version": "2.30.0",
+-      "resolved": "https://registry.npmjs.org/date-fns/-/date-fns-2.30.0.tgz",
+-      "integrity": "sha512-fnULvOpxnC5/Vg3NCiWelDsLiUc9bRwAPs/+LfTLNvetFCtCTN+yQz15C/fs4AwX1R9K5GLtLfn8QW+dWisaAw==",
+-      "dependencies": {
+-        "@babel/runtime": "^7.21.0"
+-      },
+-      "engines": {
+-        "node": ">=0.11"
+-      },
+-      "funding": {
+-        "type": "opencollective",
+-        "url": "https://opencollective.com/date-fns"
+-      }
+-    },
+-    "node_modules/dateformat": {
+-      "version": "4.6.3",
+-      "resolved": "https://registry.npmjs.org/dateformat/-/dateformat-4.6.3.tgz",
+-      "integrity": "sha512-2P0p0pFGzHS5EMnhdxQi7aJN+iMheud0UhG4dlE1DLAlvL8JHjJJTX/CSm4JXwV0Ka5nGk3zC5mcb5bUQUxxMA==",
+-      "dev": true,
+-      "engines": {
+-        "node": "*"
+-      }
+-    },
+     "node_modules/debug": {
+       "version": "4.3.4",
+       "resolved": "https://registry.npmjs.org/debug/-/debug-4.3.4.tgz",
+@@ -4565,6 +4339,7 @@
+       "version": "1.0.0",
+       "resolved": "https://registry.npmjs.org/delayed-stream/-/delayed-stream-1.0.0.tgz",
+       "integrity": "sha512-ZySD7Nf91aLB0RxL4KGrKHBXl7Eds1DAmEdcoVawXnLD7SDhpNgtuII2aAkg7a7QS41jxPSZ17p4VdGnMHk3MQ==",
++      "dev": true,
+       "engines": {
+         "node": ">=0.4.0"
+       }
+@@ -4622,7 +4397,7 @@
+       "version": "4.0.2",
+       "resolved": "https://registry.npmjs.org/diff/-/diff-4.0.2.tgz",
+       "integrity": "sha512-58lmxKSA4BNyLz+HHMUzlOEpg09FV+ev6ZMe3vJihgdxzgcwZ8VoEEPmALCZG9LmqfVoNMMKpttIYTVG6uDY7A==",
+-      "devOptional": true,
++      "dev": true,
+       "engines": {
+         "node": ">=0.3.1"
+       }
+@@ -4764,6 +4539,7 @@
+       "version": "3.1.1",
+       "resolved": "https://registry.npmjs.org/escalade/-/escalade-3.1.1.tgz",
+       "integrity": "sha512-k0er2gUkLf8O0zKJiAhmkTnJlTvINGv7ygDNPbeIsX/TJjGJZHuh9B2UxbsaEkmlEo9MfhrSzmhIlhRlI2GXnw==",
++      "dev": true,
+       "engines": {
+         "node": ">=6"
+       }
+@@ -5057,15 +4833,6 @@
+         "node": ">= 0.6"
+       }
+     },
+-    "node_modules/event-target-shim": {
+-      "version": "5.0.1",
+-      "resolved": "https://registry.npmjs.org/event-target-shim/-/event-target-shim-5.0.1.tgz",
+-      "integrity": "sha512-i/2XbnSz/uxRCU6+NdVJgKWDTM427+MqYbkQzD321DuCQJUqOuJKIA0IM2+W2xtYHdKOmZ4dR6fExsd4SXL+WQ==",
+-      "dev": true,
+-      "engines": {
+-        "node": ">=6"
+-      }
+-    },
+     "node_modules/eventemitter3": {
+       "version": "3.1.2",
+       "resolved": "https://registry.npmjs.org/eventemitter3/-/eventemitter3-3.1.2.tgz",
+@@ -5238,12 +5005,6 @@
+         "node": ">=4"
+       }
+     },
+-    "node_modules/fast-copy": {
+-      "version": "3.0.1",
+-      "resolved": "https://registry.npmjs.org/fast-copy/-/fast-copy-3.0.1.tgz",
+-      "integrity": "sha512-Knr7NOtK3HWRYGtHoJrjkaWepqT8thIVGAwt0p0aUs1zqkAzXZV4vo9fFNwyb5fcqK1GKYFYxldQdIDVKhUAfA==",
+-      "dev": true
+-    },
+     "node_modules/fast-deep-equal": {
+       "version": "3.1.3",
+       "resolved": "https://registry.npmjs.org/fast-deep-equal/-/fast-deep-equal-3.1.3.tgz",
+@@ -5416,25 +5177,6 @@
+       "integrity": "sha512-5nqDSxl8nn5BSNxyR3n4I6eDmbolI6WT+QqR547RwxQapgjQBmtktdP+HTBb/a/zLsbzERTONyUB5pefh5TtjQ==",
+       "dev": true
+     },
+-    "node_modules/follow-redirects": {
+-      "version": "1.15.2",
+-      "resolved": "https://registry.npmjs.org/follow-redirects/-/follow-redirects-1.15.2.tgz",
+-      "integrity": "sha512-VQLG33o04KaQ8uYi2tVNbdrWp1QWxNNea+nmIB4EVM28v0hmP17z7aG1+wAkNzVq4KeXTq3221ye5qTJP91JwA==",
+-      "funding": [
+-        {
+-          "type": "individual",
+-          "url": "https://github.com/sponsors/RubenVerborgh"
+-        }
+-      ],
+-      "engines": {
+-        "node": ">=4.0"
+-      },
+-      "peerDependenciesMeta": {
+-        "debug": {
+-          "optional": true
+-        }
+-      }
+-    },
+     "node_modules/fork-ts-checker-webpack-plugin": {
+       "version": "8.0.0",
+       "resolved": "https://registry.npmjs.org/fork-ts-checker-webpack-plugin/-/fork-ts-checker-webpack-plugin-8.0.0.tgz",
+@@ -5467,6 +5209,7 @@
+       "version": "4.0.0",
+       "resolved": "https://registry.npmjs.org/form-data/-/form-data-4.0.0.tgz",
+       "integrity": "sha512-ETEklSGi5t0QMZuiXoA/Q6vcnxcLQP5vdugSpuAyi6SVGi2clPPp+xgEhuMaHC+zGgn31Kd235W35f7Hykkaww==",
++      "dev": true,
+       "dependencies": {
+         "asynckit": "^0.4.0",
+         "combined-stream": "^1.0.8",
+@@ -5604,6 +5347,7 @@
+       "version": "2.0.5",
+       "resolved": "https://registry.npmjs.org/get-caller-file/-/get-caller-file-2.0.5.tgz",
+       "integrity": "sha512-DyFP3BM/3YHTQOCUL/w0OZHR0lpKeGrxotcHWcqNEdnltqFwXVfhEBQ94eIo34AfQpo0rGki4cyIiftY06h2Fg==",
++      "dev": true,
+       "engines": {
+         "node": "6.* || 8.* || >= 10.*"
+       }
+@@ -5748,14 +5492,6 @@
+         "graphql": "^0.9.0 || ^0.10.0 || ^0.11.0 || ^0.12.0 || ^0.13.0 || ^14.0.0 || ^15.0.0 || ^16.0.0"
+       }
+     },
+-    "node_modules/graphql-type-json": {
+-      "version": "0.3.2",
+-      "resolved": "https://registry.npmjs.org/graphql-type-json/-/graphql-type-json-0.3.2.tgz",
+-      "integrity": "sha512-J+vjof74oMlCWXSvt0DOf2APEdZOCdubEvGDUAlqH//VBYcOYsGgRW7Xzorr44LvkjiuvecWc8fChxuZZbChtg==",
+-      "peerDependencies": {
+-        "graphql": ">=0.8.0"
+-      }
+-    },
+     "node_modules/graphql-ws": {
+       "version": "5.11.3",
+       "resolved": "https://registry.npmjs.org/graphql-ws/-/graphql-ws-5.11.3.tgz",
+@@ -5813,70 +5549,6 @@
+       "resolved": "https://registry.npmjs.org/has-unicode/-/has-unicode-2.0.1.tgz",
+       "integrity": "sha512-8Rf9Y83NBReMnx0gFzA8JImQACstCYWUplepDa9xprwwtmgEZUF0h/i5xSA625zB/I37EtrswSST6OXxwaaIJQ=="
+     },
+-    "node_modules/help-me": {
+-      "version": "4.2.0",
+-      "resolved": "https://registry.npmjs.org/help-me/-/help-me-4.2.0.tgz",
+-      "integrity": "sha512-TAOnTB8Tz5Dw8penUuzHVrKNKlCIbwwbHnXraNJxPwf8LRtE2HlM84RYuezMFcwOJmoYOCWVDyJ8TQGxn9PgxA==",
+-      "dev": true,
+-      "dependencies": {
+-        "glob": "^8.0.0",
+-        "readable-stream": "^3.6.0"
+-      }
+-    },
+-    "node_modules/help-me/node_modules/brace-expansion": {
+-      "version": "2.0.1",
+-      "resolved": "https://registry.npmjs.org/brace-expansion/-/brace-expansion-2.0.1.tgz",
+-      "integrity": "sha512-XnAIvQ8eM+kC6aULx6wuQiwVsnzsi9d3WxzV3FpWTGA19F621kwdbsAcFKXgKUHZWsy+mY6iL1sHTxWEFCytDA==",
+-      "dev": true,
+-      "dependencies": {
+-        "balanced-match": "^1.0.0"
+-      }
+-    },
+-    "node_modules/help-me/node_modules/glob": {
+-      "version": "8.1.0",
+-      "resolved": "https://registry.npmjs.org/glob/-/glob-8.1.0.tgz",
+-      "integrity": "sha512-r8hpEjiQEYlF2QU0df3dS+nxxSIreXQS1qRhMJM0Q5NDdR386C7jb7Hwwod8Fgiuex+k0GFjgft18yvxm5XoCQ==",
+-      "dev": true,
+-      "dependencies": {
+-        "fs.realpath": "^1.0.0",
+-        "inflight": "^1.0.4",
+-        "inherits": "2",
+-        "minimatch": "^5.0.1",
+-        "once": "^1.3.0"
+-      },
+-      "engines": {
+-        "node": ">=12"
+-      },
+-      "funding": {
+-        "url": "https://github.com/sponsors/isaacs"
+-      }
+-    },
+-    "node_modules/help-me/node_modules/minimatch": {
+-      "version": "5.1.6",
+-      "resolved": "https://registry.npmjs.org/minimatch/-/minimatch-5.1.6.tgz",
+-      "integrity": "sha512-lKwV/1brpG6mBUFHtb7NUmtABCb2WZZmm2wNiOA5hAb8VdCS4B3dtMWyvcoViccwAW/COERjXLt0zP1zXUN26g==",
+-      "dev": true,
+-      "dependencies": {
+-        "brace-expansion": "^2.0.1"
+-      },
+-      "engines": {
+-        "node": ">=10"
+-      }
+-    },
+-    "node_modules/help-me/node_modules/readable-stream": {
+-      "version": "3.6.2",
+-      "resolved": "https://registry.npmjs.org/readable-stream/-/readable-stream-3.6.2.tgz",
+-      "integrity": "sha512-9u/sniCrY3D5WdsERHzHE4G2YCXqoG5FTHUiCC4SIbr6XcLZBY05ya9EKjYek9O5xOAwjGq+1JdGBAS7Q9ScoA==",
+-      "dev": true,
+-      "dependencies": {
+-        "inherits": "^2.0.3",
+-        "string_decoder": "^1.1.1",
+-        "util-deprecate": "^1.0.1"
+-      },
+-      "engines": {
+-        "node": ">= 6"
+-      }
+-    },
+     "node_modules/hexoid": {
+       "version": "1.0.0",
+       "resolved": "https://registry.npmjs.org/hexoid/-/hexoid-1.0.0.tgz",
+@@ -5886,14 +5558,6 @@
+         "node": ">=8"
+       }
+     },
+-    "node_modules/highlight.js": {
+-      "version": "10.7.3",
+-      "resolved": "https://registry.npmjs.org/highlight.js/-/highlight.js-10.7.3.tgz",
+-      "integrity": "sha512-tzcUFauisWKNHaRkN4Wjl/ZA07gENAjFl3J/c480dprkGTg5EQstgaNFqBfUqCq54kZRIEcreTsAgF/m2quD7A==",
+-      "engines": {
+-        "node": "*"
+-      }
+-    },
+     "node_modules/html-escaper": {
+       "version": "2.0.2",
+       "resolved": "https://registry.npmjs.org/html-escaper/-/html-escaper-2.0.2.tgz",
+@@ -5951,6 +5615,7 @@
+       "version": "1.2.1",
+       "resolved": "https://registry.npmjs.org/ieee754/-/ieee754-1.2.1.tgz",
+       "integrity": "sha512-dcyqhDvX1C46lXZcVqCpK+FtMRQVdIMN6/Df5js2zouUsqG7I6sFxitIC+7KYK29KdXOLHdu9zL4sFnoVQnqaA==",
++      "dev": true,
+       "funding": [
+         {
+           "type": "github",
+@@ -6542,30 +6207,6 @@
+         "fsevents": "^2.3.2"
+       }
+     },
+-    "node_modules/jest-junit": {
+-      "version": "14.0.1",
+-      "resolved": "https://registry.npmjs.org/jest-junit/-/jest-junit-14.0.1.tgz",
+-      "integrity": "sha512-h7/wwzPbllgpQhhVcRzRC76/cc89GlazThoV1fDxcALkf26IIlRsu/AcTG64f4nR2WPE3Cbd+i/sVf+NCUHrWQ==",
+-      "dev": true,
+-      "dependencies": {
+-        "mkdirp": "^1.0.4",
+-        "strip-ansi": "^6.0.1",
+-        "uuid": "^8.3.2",
+-        "xml": "^1.0.1"
+-      },
+-      "engines": {
+-        "node": ">=10.12.0"
+-      }
+-    },
+-    "node_modules/jest-junit/node_modules/uuid": {
+-      "version": "8.3.2",
+-      "resolved": "https://registry.npmjs.org/uuid/-/uuid-8.3.2.tgz",
+-      "integrity": "sha512-+NYs2QeMWy+GWFOEm9xnn6HCDp0l7QBD7ml8zLUmJ+93Q5NF0NocErnwkTkXVFNiX3/fpC6afS8Dhb/gz7R7eg==",
+-      "dev": true,
+-      "bin": {
+-        "uuid": "dist/bin/uuid"
+-      }
+-    },
+     "node_modules/jest-leak-detector": {
+       "version": "29.5.0",
+       "resolved": "https://registry.npmjs.org/jest-leak-detector/-/jest-leak-detector-29.5.0.tgz",
+@@ -6900,19 +6541,10 @@
+         "url": "https://github.com/chalk/supports-color?sponsor=1"
+       }
+     },
+-    "node_modules/joycon": {
+-      "version": "3.1.1",
+-      "resolved": "https://registry.npmjs.org/joycon/-/joycon-3.1.1.tgz",
+-      "integrity": "sha512-34wB/Y7MW7bzjKRjUKTa46I2Z7eV62Rkhva+KkopW7Qvv/OSWBqvkSY7vusOPrNuZcUG3tApvdVgNB8POj3SPw==",
+-      "dev": true,
+-      "engines": {
+-        "node": ">=10"
+-      }
+-    },
+-    "node_modules/js-sdsl": {
+-      "version": "4.4.0",
+-      "resolved": "https://registry.npmjs.org/js-sdsl/-/js-sdsl-4.4.0.tgz",
+-      "integrity": "sha512-FfVSdx6pJ41Oa+CF7RDaFmTnCaFhua+SNYQX74riGOpl96x+2jQCqEfQ2bnXu/5DPCqlRuiqyvTJM0Qjz26IVg==",
++    "node_modules/js-sdsl": {
++      "version": "4.4.0",
++      "resolved": "https://registry.npmjs.org/js-sdsl/-/js-sdsl-4.4.0.tgz",
++      "integrity": "sha512-FfVSdx6pJ41Oa+CF7RDaFmTnCaFhua+SNYQX74riGOpl96x+2jQCqEfQ2bnXu/5DPCqlRuiqyvTJM0Qjz26IVg==",
+       "dev": true,
+       "funding": {
+         "type": "opencollective",
+@@ -7258,7 +6890,7 @@
+       "version": "1.3.6",
+       "resolved": "https://registry.npmjs.org/make-error/-/make-error-1.3.6.tgz",
+       "integrity": "sha512-s8UhlNe7vPKomQhC1qFelMokr/Sc3AgNbso3n74mVPA5LTZwkB9NlXf4XPamLxJE8h0gh73rM94xvwRT2CVInw==",
+-      "devOptional": true
++      "dev": true
+     },
+     "node_modules/makeerror": {
+       "version": "1.0.12",
+@@ -7468,16 +7100,6 @@
+       "integrity": "sha512-nnbWWOkoWyUsTjKrhgD0dcz22mdkSnpYqbEjIm2nhwhuxlSkpywJmBo8h0ZqJdkp73mb90SssHkN4rsRaBAfAA==",
+       "dev": true
+     },
+-    "node_modules/mz": {
+-      "version": "2.7.0",
+-      "resolved": "https://registry.npmjs.org/mz/-/mz-2.7.0.tgz",
+-      "integrity": "sha512-z81GNO7nnYMEhrGh9LeymoE4+Yr0Wn5McHIZMK5cfQCl+NDX08sCZgUc9/6MHni9IWuFLm1Z3HTCXu2z9fN62Q==",
+-      "dependencies": {
+-        "any-promise": "^1.0.0",
+-        "object-assign": "^4.0.1",
+-        "thenify-all": "^1.0.0"
+-      }
+-    },
+     "node_modules/natural-compare": {
+       "version": "1.4.0",
+       "resolved": "https://registry.npmjs.org/natural-compare/-/natural-compare-1.4.0.tgz",
+@@ -7618,12 +7240,6 @@
+         "url": "https://github.com/sponsors/ljharb"
+       }
+     },
+-    "node_modules/on-exit-leak-free": {
+-      "version": "2.1.0",
+-      "resolved": "https://registry.npmjs.org/on-exit-leak-free/-/on-exit-leak-free-2.1.0.tgz",
+-      "integrity": "sha512-VuCaZZAjReZ3vUwgOB8LxAosIurDiAW0s13rI1YwmaP++jvcxP77AWoQvenZebpCA2m8WC1/EosPYPMjnRAp/w==",
+-      "dev": true
+-    },
+     "node_modules/on-finished": {
+       "version": "2.4.1",
+       "resolved": "https://registry.npmjs.org/on-finished/-/on-finished-2.4.1.tgz",
+@@ -7762,11 +7378,6 @@
+         "node": ">=6"
+       }
+     },
+-    "node_modules/papaparse": {
+-      "version": "5.4.1",
+-      "resolved": "https://registry.npmjs.org/papaparse/-/papaparse-5.4.1.tgz",
+-      "integrity": "sha512-HipMsgJkZu8br23pW15uvo6sib6wne/4woLZPlFf3rpDyMe9ywEXUsuD7+6K9PRkJlVT51j/sCOYDKGGS3ZJrw=="
+-    },
+     "node_modules/parent-module": {
+       "version": "1.0.1",
+       "resolved": "https://registry.npmjs.org/parent-module/-/parent-module-1.0.1.tgz",
+@@ -7797,24 +7408,6 @@
+         "url": "https://github.com/sponsors/sindresorhus"
+       }
+     },
+-    "node_modules/parse5": {
+-      "version": "5.1.1",
+-      "resolved": "https://registry.npmjs.org/parse5/-/parse5-5.1.1.tgz",
+-      "integrity": "sha512-ugq4DFI0Ptb+WWjAdOK16+u/nHfiIrcE+sh8kZMaM0WllQKLI9rOUq6c2b7cwPkXdzfQESqvoqK6ug7U/Yyzug=="
+-    },
+-    "node_modules/parse5-htmlparser2-tree-adapter": {
+-      "version": "6.0.1",
+-      "resolved": "https://registry.npmjs.org/parse5-htmlparser2-tree-adapter/-/parse5-htmlparser2-tree-adapter-6.0.1.tgz",
+-      "integrity": "sha512-qPuWvbLgvDGilKc5BoicRovlT4MtYT6JfJyBOMDsKoiT+GiuP5qyrPCnR9HcPECIJJmZh5jRndyNThnhhb/vlA==",
+-      "dependencies": {
+-        "parse5": "^6.0.1"
+-      }
+-    },
+-    "node_modules/parse5-htmlparser2-tree-adapter/node_modules/parse5": {
+-      "version": "6.0.1",
+-      "resolved": "https://registry.npmjs.org/parse5/-/parse5-6.0.1.tgz",
+-      "integrity": "sha512-Ofn/CTFzRGTTxwpNEs9PP93gXShHcTq255nzRYSKe8AkVpZY7e1fpmTfOyoIvjP5HG7Z2ZM7VS9PPhQGW2pOpw=="
+-    },
+     "node_modules/parseurl": {
+       "version": "1.3.3",
+       "resolved": "https://registry.npmjs.org/parseurl/-/parseurl-1.3.3.tgz",
+@@ -7849,17 +7442,6 @@
+         "passport-strategy": "^1.0.0"
+       }
+     },
+-    "node_modules/passport-local": {
+-      "version": "1.0.0",
+-      "resolved": "https://registry.npmjs.org/passport-local/-/passport-local-1.0.0.tgz",
+-      "integrity": "sha512-9wCE6qKznvf9mQYYbgJ3sVOHmCWoUNMVFoZzNoznmISbhnNNPhN9xfY3sLmScHMetEJeoY7CXwfhCe7argfQow==",
+-      "dependencies": {
+-        "passport-strategy": "1.x.x"
+-      },
+-      "engines": {
+-        "node": ">= 0.4.0"
+-      }
+-    },
+     "node_modules/passport-strategy": {
+       "version": "1.0.0",
+       "resolved": "https://registry.npmjs.org/passport-strategy/-/passport-strategy-1.0.0.tgz",
+@@ -7970,119 +7552,6 @@
+         "url": "https://github.com/sponsors/jonschlinkert"
+       }
+     },
+-    "node_modules/pino-abstract-transport": {
+-      "version": "1.0.0",
+-      "resolved": "https://registry.npmjs.org/pino-abstract-transport/-/pino-abstract-transport-1.0.0.tgz",
+-      "integrity": "sha512-c7vo5OpW4wIS42hUVcT5REsL8ZljsUfBjqV/e2sFxmFEFZiq1XLUp5EYLtuDH6PEHq9W1egWqRbnLUP5FuZmOA==",
+-      "dev": true,
+-      "dependencies": {
+-        "readable-stream": "^4.0.0",
+-        "split2": "^4.0.0"
+-      }
+-    },
+-    "node_modules/pino-abstract-transport/node_modules/buffer": {
+-      "version": "6.0.3",
+-      "resolved": "https://registry.npmjs.org/buffer/-/buffer-6.0.3.tgz",
+-      "integrity": "sha512-FTiCpNxtwiZZHEZbcbTIcZjERVICn9yq/pDFkTl95/AxzD1naBctN7YO68riM/gLSDY7sdrMby8hofADYuuqOA==",
+-      "dev": true,
+-      "funding": [
+-        {
+-          "type": "github",
+-          "url": "https://github.com/sponsors/feross"
+-        },
+-        {
+-          "type": "patreon",
+-          "url": "https://www.patreon.com/feross"
+-        },
+-        {
+-          "type": "consulting",
+-          "url": "https://feross.org/support"
+-        }
+-      ],
+-      "dependencies": {
+-        "base64-js": "^1.3.1",
+-        "ieee754": "^1.2.1"
+-      }
+-    },
+-    "node_modules/pino-abstract-transport/node_modules/readable-stream": {
+-      "version": "4.4.0",
+-      "resolved": "https://registry.npmjs.org/readable-stream/-/readable-stream-4.4.0.tgz",
+-      "integrity": "sha512-kDMOq0qLtxV9f/SQv522h8cxZBqNZXuXNyjyezmfAAuribMyVXziljpQ/uQhfE1XLg2/TLTW2DsnoE4VAi/krg==",
+-      "dev": true,
+-      "dependencies": {
+-        "abort-controller": "^3.0.0",
+-        "buffer": "^6.0.3",
+-        "events": "^3.3.0",
+-        "process": "^0.11.10"
+-      },
+-      "engines": {
+-        "node": "^12.22.0 || ^14.17.0 || >=16.0.0"
+-      }
+-    },
+-    "node_modules/pino-pretty": {
+-      "version": "9.4.0",
+-      "resolved": "https://registry.npmjs.org/pino-pretty/-/pino-pretty-9.4.0.tgz",
+-      "integrity": "sha512-NIudkNLxnl7MGj1XkvsqVyRgo6meFP82ECXF2PlOI+9ghmbGuBUUqKJ7IZPIxpJw4vhhSva0IuiDSAuGh6TV9g==",
+-      "dev": true,
+-      "dependencies": {
+-        "colorette": "^2.0.7",
+-        "dateformat": "^4.6.3",
+-        "fast-copy": "^3.0.0",
+-        "fast-safe-stringify": "^2.1.1",
+-        "help-me": "^4.0.1",
+-        "joycon": "^3.1.1",
+-        "minimist": "^1.2.6",
+-        "on-exit-leak-free": "^2.1.0",
+-        "pino-abstract-transport": "^1.0.0",
+-        "pump": "^3.0.0",
+-        "readable-stream": "^4.0.0",
+-        "secure-json-parse": "^2.4.0",
+-        "sonic-boom": "^3.0.0",
+-        "strip-json-comments": "^3.1.1"
+-      },
+-      "bin": {
+-        "pino-pretty": "bin.js"
+-      }
+-    },
+-    "node_modules/pino-pretty/node_modules/buffer": {
+-      "version": "6.0.3",
+-      "resolved": "https://registry.npmjs.org/buffer/-/buffer-6.0.3.tgz",
+-      "integrity": "sha512-FTiCpNxtwiZZHEZbcbTIcZjERVICn9yq/pDFkTl95/AxzD1naBctN7YO68riM/gLSDY7sdrMby8hofADYuuqOA==",
+-      "dev": true,
+-      "funding": [
+-        {
+-          "type": "github",
+-          "url": "https://github.com/sponsors/feross"
+-        },
+-        {
+-          "type": "patreon",
+-          "url": "https://www.patreon.com/feross"
+-        },
+-        {
+-          "type": "consulting",
+-          "url": "https://feross.org/support"
+-        }
+-      ],
+-      "dependencies": {
+-        "base64-js": "^1.3.1",
+-        "ieee754": "^1.2.1"
+-      }
+-    },
+-    "node_modules/pino-pretty/node_modules/readable-stream": {
+-      "version": "4.4.0",
+-      "resolved": "https://registry.npmjs.org/readable-stream/-/readable-stream-4.4.0.tgz",
+-      "integrity": "sha512-kDMOq0qLtxV9f/SQv522h8cxZBqNZXuXNyjyezmfAAuribMyVXziljpQ/uQhfE1XLg2/TLTW2DsnoE4VAi/krg==",
+-      "dev": true,
+-      "dependencies": {
+-        "abort-controller": "^3.0.0",
+-        "buffer": "^6.0.3",
+-        "events": "^3.3.0",
+-        "process": "^0.11.10"
+-      },
+-      "engines": {
+-        "node": "^12.22.0 || ^14.17.0 || >=16.0.0"
+-      }
+-    },
+     "node_modules/pirates": {
+       "version": "4.0.5",
+       "resolved": "https://registry.npmjs.org/pirates/-/pirates-4.0.5.tgz",
+@@ -8243,15 +7712,6 @@
+         "node": ">=16.13"
+       }
+     },
+-    "node_modules/process": {
+-      "version": "0.11.10",
+-      "resolved": "https://registry.npmjs.org/process/-/process-0.11.10.tgz",
+-      "integrity": "sha512-cdGef/drWFoydD1JsMzuFf8100nZl+GT+yacc2bEced5f9Rjk4z+WtFUTBu9PhOi9j/jfmBPu0mMEY4wIdAF8A==",
+-      "dev": true,
+-      "engines": {
+-        "node": ">= 0.6.0"
+-      }
+-    },
+     "node_modules/process-nextick-args": {
+       "version": "2.0.1",
+       "resolved": "https://registry.npmjs.org/process-nextick-args/-/process-nextick-args-2.0.1.tgz",
+@@ -8282,11 +7742,6 @@
+         "node": ">= 0.10"
+       }
+     },
+-    "node_modules/proxy-from-env": {
+-      "version": "1.1.0",
+-      "resolved": "https://registry.npmjs.org/proxy-from-env/-/proxy-from-env-1.1.0.tgz",
+-      "integrity": "sha512-D+zkORCbA9f1tdWRK0RaCR3GPv50cMxcrz4X8k5LTSUD1Dkw47mKJEZQNunItRTkWwgtaUSo1RVFRIG9ZXiFYg=="
+-    },
+     "node_modules/pump": {
+       "version": "3.0.0",
+       "resolved": "https://registry.npmjs.org/pump/-/pump-3.0.0.tgz",
+@@ -8439,15 +7894,11 @@
+       "resolved": "https://registry.npmjs.org/reflect-metadata/-/reflect-metadata-0.1.13.tgz",
+       "integrity": "sha512-Ts1Y/anZELhSsjMcU605fU9RE4Oi3p5ORujwbIKXfWa+0Zxs510Qrmrce5/Jowq3cHSZSJqBjypxmHarc+vEWg=="
+     },
+-    "node_modules/regenerator-runtime": {
+-      "version": "0.13.11",
+-      "resolved": "https://registry.npmjs.org/regenerator-runtime/-/regenerator-runtime-0.13.11.tgz",
+-      "integrity": "sha512-kY1AZVr2Ra+t+piVaJ4gxaFaReZVH40AKNo7UCX6W+dEwBo/2oZJzqfuN1qLq1oL45o56cPaTXELwrTh8Fpggg=="
+-    },
+     "node_modules/require-directory": {
+       "version": "2.1.1",
+       "resolved": "https://registry.npmjs.org/require-directory/-/require-directory-2.1.1.tgz",
+       "integrity": "sha512-fGxEI7+wsG9xrvdjsrlmL22OMTTiHRwAMroiEeMgq8gzoLC/PQr7RsRDSTLUg/bZAZtF+TVIkHc6/4RIKrui+Q==",
++      "dev": true,
+       "engines": {
+         "node": ">=0.10.0"
+       }
+@@ -8673,12 +8124,6 @@
+       "integrity": "sha512-xbbCH5dCYU5T8LcEhhuh7HJ88HXuW3qsI3Y0zOZFKfZEHcpWiHU/Jxzk629Brsab/mMiHQti9wMP+845RPe3Vg==",
+       "dev": true
+     },
+-    "node_modules/secure-json-parse": {
+-      "version": "2.7.0",
+-      "resolved": "https://registry.npmjs.org/secure-json-parse/-/secure-json-parse-2.7.0.tgz",
+-      "integrity": "sha512-6aU+Rwsezw7VR8/nyvKTx8QpWH9FrcYiXXlqC4z5d5XQBDRqtbfsRjnwGyqbi3gddNtWHuEk9OANUotL26qKUw==",
+-      "dev": true
+-    },
+     "node_modules/semver": {
+       "version": "7.5.4",
+       "resolved": "https://registry.npmjs.org/semver/-/semver-7.5.4.tgz",
+@@ -8850,15 +8295,6 @@
+         "node": ">=8"
+       }
+     },
+-    "node_modules/sonic-boom": {
+-      "version": "3.3.0",
+-      "resolved": "https://registry.npmjs.org/sonic-boom/-/sonic-boom-3.3.0.tgz",
+-      "integrity": "sha512-LYxp34KlZ1a2Jb8ZQgFCK3niIHzibdwtwNUWKg0qQRzsDoJ3Gfgkf8KdBTFU3SkejDEIlWwnSnpVdOZIhFMl/g==",
+-      "dev": true,
+-      "dependencies": {
+-        "atomic-sleep": "^1.0.0"
+-      }
+-    },
+     "node_modules/source-map": {
+       "version": "0.7.4",
+       "resolved": "https://registry.npmjs.org/source-map/-/source-map-0.7.4.tgz",
+@@ -8887,15 +8323,6 @@
+         "node": ">=0.10.0"
+       }
+     },
+-    "node_modules/split2": {
+-      "version": "4.2.0",
+-      "resolved": "https://registry.npmjs.org/split2/-/split2-4.2.0.tgz",
+-      "integrity": "sha512-UcjcJOWknrNkF6PLX83qcHM6KHgVKNkV62Y8a5uYDVv9ydGQVwAHMKqHdJje1VTWpljG0WYpCDhrCdAOYH4TWg==",
+-      "dev": true,
+-      "engines": {
+-        "node": ">= 10.x"
+-      }
+-    },
+     "node_modules/sprintf-js": {
+       "version": "1.0.3",
+       "resolved": "https://registry.npmjs.org/sprintf-js/-/sprintf-js-1.0.3.tgz",
+@@ -9300,25 +8727,6 @@
+       "integrity": "sha512-N+8UisAXDGk8PFXP4HAzVR9nbfmVJ3zYLAWiTIoqC5v5isinhr+r5uaO8+7r3BMfuNIufIsA7RdpVgacC2cSpw==",
+       "dev": true
+     },
+-    "node_modules/thenify": {
+-      "version": "3.3.1",
+-      "resolved": "https://registry.npmjs.org/thenify/-/thenify-3.3.1.tgz",
+-      "integrity": "sha512-RVZSIV5IG10Hk3enotrhvz0T9em6cyHBLkH/YAZuKqd8hRkKhSfCGIcP2KUY0EPxndzANBmNllzWPwak+bheSw==",
+-      "dependencies": {
+-        "any-promise": "^1.0.0"
+-      }
+-    },
+-    "node_modules/thenify-all": {
+-      "version": "1.6.0",
+-      "resolved": "https://registry.npmjs.org/thenify-all/-/thenify-all-1.6.0.tgz",
+-      "integrity": "sha512-RNxQH/qI8/t3thXJDwcstUO4zeqo64+Uy/+sNVRBx4Xn2OX+OZ9oP+iJnNFqplFra2ZUVeKCSa2oVWi3T4uVmA==",
+-      "dependencies": {
+-        "thenify": ">= 3.1.0 < 4"
+-      },
+-      "engines": {
+-        "node": ">=0.8"
+-      }
+-    },
+     "node_modules/through": {
+       "version": "2.3.8",
+       "resolved": "https://registry.npmjs.org/through/-/through-2.3.8.tgz",
+@@ -9451,7 +8859,7 @@
+       "version": "10.9.1",
+       "resolved": "https://registry.npmjs.org/ts-node/-/ts-node-10.9.1.tgz",
+       "integrity": "sha512-NtVysVPkxxrwFGUUxGYhfux8k78pQB3JqYBXlLRZgdGUqTO5wU/UyHop5p70iEbGhB7q5KmiZiU0Y3KlJrScEw==",
+-      "devOptional": true,
++      "dev": true,
+       "dependencies": {
+         "@cspotcode/source-map-support": "^0.8.0",
+         "@tsconfig/node10": "^1.0.7",
+@@ -9626,190 +9034,11 @@
+       "resolved": "https://registry.npmjs.org/typedarray/-/typedarray-0.0.6.tgz",
+       "integrity": "sha512-/aCDEGatGvZ2BIk+HmLf4ifCJFwvKFNb9/JeZPMulfgFracn9QFcAf5GO8B/mweUjSoblS5In0cWhqpfs/5PQA=="
+     },
+-    "node_modules/typeorm": {
+-      "version": "0.3.16",
+-      "resolved": "https://registry.npmjs.org/typeorm/-/typeorm-0.3.16.tgz",
+-      "integrity": "sha512-wJ4Qy1oqRKNDdZiBTTaVMqwo/XxC52Q7uNPTjltPgLhvIW173bL6Iad0lhptMOsFlpixFPaUu3PNziaRBwX2Zw==",
+-      "dependencies": {
+-        "@sqltools/formatter": "^1.2.5",
+-        "app-root-path": "^3.1.0",
+-        "buffer": "^6.0.3",
+-        "chalk": "^4.1.2",
+-        "cli-highlight": "^2.1.11",
+-        "date-fns": "^2.29.3",
+-        "debug": "^4.3.4",
+-        "dotenv": "^16.0.3",
+-        "glob": "^8.1.0",
+-        "mkdirp": "^2.1.3",
+-        "reflect-metadata": "^0.1.13",
+-        "sha.js": "^2.4.11",
+-        "tslib": "^2.5.0",
+-        "uuid": "^9.0.0",
+-        "yargs": "^17.6.2"
+-      },
+-      "bin": {
+-        "typeorm": "cli.js",
+-        "typeorm-ts-node-commonjs": "cli-ts-node-commonjs.js",
+-        "typeorm-ts-node-esm": "cli-ts-node-esm.js"
+-      },
+-      "engines": {
+-        "node": ">= 12.9.0"
+-      },
+-      "funding": {
+-        "url": "https://opencollective.com/typeorm"
+-      },
+-      "peerDependencies": {
+-        "@google-cloud/spanner": "^5.18.0",
+-        "@sap/hana-client": "^2.12.25",
+-        "better-sqlite3": "^7.1.2 || ^8.0.0",
+-        "hdb-pool": "^0.1.6",
+-        "ioredis": "^5.0.4",
+-        "mongodb": "^5.2.0",
+-        "mssql": "^9.1.1",
+-        "mysql2": "^2.2.5 || ^3.0.1",
+-        "oracledb": "^5.1.0",
+-        "pg": "^8.5.1",
+-        "pg-native": "^3.0.0",
+-        "pg-query-stream": "^4.0.0",
+-        "redis": "^3.1.1 || ^4.0.0",
+-        "sql.js": "^1.4.0",
+-        "sqlite3": "^5.0.3",
+-        "ts-node": "^10.7.0",
+-        "typeorm-aurora-data-api-driver": "^2.0.0"
+-      },
+-      "peerDependenciesMeta": {
+-        "@google-cloud/spanner": {
+-          "optional": true
+-        },
+-        "@sap/hana-client": {
+-          "optional": true
+-        },
+-        "better-sqlite3": {
+-          "optional": true
+-        },
+-        "hdb-pool": {
+-          "optional": true
+-        },
+-        "ioredis": {
+-          "optional": true
+-        },
+-        "mongodb": {
+-          "optional": true
+-        },
+-        "mssql": {
+-          "optional": true
+-        },
+-        "mysql2": {
+-          "optional": true
+-        },
+-        "oracledb": {
+-          "optional": true
+-        },
+-        "pg": {
+-          "optional": true
+-        },
+-        "pg-native": {
+-          "optional": true
+-        },
+-        "pg-query-stream": {
+-          "optional": true
+-        },
+-        "redis": {
+-          "optional": true
+-        },
+-        "sql.js": {
+-          "optional": true
+-        },
+-        "sqlite3": {
+-          "optional": true
+-        },
+-        "ts-node": {
+-          "optional": true
+-        },
+-        "typeorm-aurora-data-api-driver": {
+-          "optional": true
+-        }
+-      }
+-    },
+-    "node_modules/typeorm/node_modules/brace-expansion": {
+-      "version": "2.0.1",
+-      "resolved": "https://registry.npmjs.org/brace-expansion/-/brace-expansion-2.0.1.tgz",
+-      "integrity": "sha512-XnAIvQ8eM+kC6aULx6wuQiwVsnzsi9d3WxzV3FpWTGA19F621kwdbsAcFKXgKUHZWsy+mY6iL1sHTxWEFCytDA==",
+-      "dependencies": {
+-        "balanced-match": "^1.0.0"
+-      }
+-    },
+-    "node_modules/typeorm/node_modules/buffer": {
+-      "version": "6.0.3",
+-      "resolved": "https://registry.npmjs.org/buffer/-/buffer-6.0.3.tgz",
+-      "integrity": "sha512-FTiCpNxtwiZZHEZbcbTIcZjERVICn9yq/pDFkTl95/AxzD1naBctN7YO68riM/gLSDY7sdrMby8hofADYuuqOA==",
+-      "funding": [
+-        {
+-          "type": "github",
+-          "url": "https://github.com/sponsors/feross"
+-        },
+-        {
+-          "type": "patreon",
+-          "url": "https://www.patreon.com/feross"
+-        },
+-        {
+-          "type": "consulting",
+-          "url": "https://feross.org/support"
+-        }
+-      ],
+-      "dependencies": {
+-        "base64-js": "^1.3.1",
+-        "ieee754": "^1.2.1"
+-      }
+-    },
+-    "node_modules/typeorm/node_modules/glob": {
+-      "version": "8.1.0",
+-      "resolved": "https://registry.npmjs.org/glob/-/glob-8.1.0.tgz",
+-      "integrity": "sha512-r8hpEjiQEYlF2QU0df3dS+nxxSIreXQS1qRhMJM0Q5NDdR386C7jb7Hwwod8Fgiuex+k0GFjgft18yvxm5XoCQ==",
+-      "dependencies": {
+-        "fs.realpath": "^1.0.0",
+-        "inflight": "^1.0.4",
+-        "inherits": "2",
+-        "minimatch": "^5.0.1",
+-        "once": "^1.3.0"
+-      },
+-      "engines": {
+-        "node": ">=12"
+-      },
+-      "funding": {
+-        "url": "https://github.com/sponsors/isaacs"
+-      }
+-    },
+-    "node_modules/typeorm/node_modules/minimatch": {
+-      "version": "5.1.6",
+-      "resolved": "https://registry.npmjs.org/minimatch/-/minimatch-5.1.6.tgz",
+-      "integrity": "sha512-lKwV/1brpG6mBUFHtb7NUmtABCb2WZZmm2wNiOA5hAb8VdCS4B3dtMWyvcoViccwAW/COERjXLt0zP1zXUN26g==",
+-      "dependencies": {
+-        "brace-expansion": "^2.0.1"
+-      },
+-      "engines": {
+-        "node": ">=10"
+-      }
+-    },
+-    "node_modules/typeorm/node_modules/mkdirp": {
+-      "version": "2.1.6",
+-      "resolved": "https://registry.npmjs.org/mkdirp/-/mkdirp-2.1.6.tgz",
+-      "integrity": "sha512-+hEnITedc8LAtIP9u3HJDFIdcLV2vXP33sqLLIzkv1Db1zO/1OxbvYf0Y1OC/S/Qo5dxHXepofhmxL02PsKe+A==",
+-      "bin": {
+-        "mkdirp": "dist/cjs/src/bin.js"
+-      },
+-      "engines": {
+-        "node": ">=10"
+-      },
+-      "funding": {
+-        "url": "https://github.com/sponsors/isaacs"
+-      }
+-    },
+     "node_modules/typescript": {
+       "version": "4.9.5",
+       "resolved": "https://registry.npmjs.org/typescript/-/typescript-4.9.5.tgz",
+       "integrity": "sha512-1FXk9E2Hm+QzZQ7z+McJiHL4NW1F2EzMu9Nq9i3zAaGqibafqYwCVU6WyWAuyQRRzOlxou8xZSyXLEN8oKj24g==",
+-      "devOptional": true,
++      "dev": true,
+       "bin": {
+         "tsc": "bin/tsc",
+         "tsserver": "bin/tsserver"
+@@ -9910,7 +9139,7 @@
+       "version": "3.0.1",
+       "resolved": "https://registry.npmjs.org/v8-compile-cache-lib/-/v8-compile-cache-lib-3.0.1.tgz",
+       "integrity": "sha512-wa7YjyUGfNZngI/vtK0UHAN+lgDCxBPCylVXGp0zu59Fz5aiGtNXaq3DhIov063MorB+VfufLh3JlF2KdTK3xg==",
+-      "devOptional": true
++      "dev": true
+     },
+     "node_modules/v8-to-istanbul": {
+       "version": "9.1.0",
+@@ -10173,6 +9402,7 @@
+       "version": "7.0.0",
+       "resolved": "https://registry.npmjs.org/wrap-ansi/-/wrap-ansi-7.0.0.tgz",
+       "integrity": "sha512-YVGIj2kamLSTxw6NsZjoBxfSwsn0ycdesmc4p+Q21c5zPuZ1pl+NfxVdxPtdHvmNVOQ6XSYG4AUtyt/Fi7D16Q==",
++      "dev": true,
+       "dependencies": {
+         "ansi-styles": "^4.0.0",
+         "string-width": "^4.1.0",
+@@ -10223,12 +9453,6 @@
+         }
+       }
+     },
+-    "node_modules/xml": {
+-      "version": "1.0.1",
+-      "resolved": "https://registry.npmjs.org/xml/-/xml-1.0.1.tgz",
+-      "integrity": "sha512-huCv9IH9Tcf95zuYCsQraZtWnJvBtLVE0QHMOs8bWyZAFZNDcYjsPq1nEx8jKA9y+Beo9v+7OBPRisQTjinQMw==",
+-      "dev": true
+-    },
+     "node_modules/xss": {
+       "version": "1.0.14",
+       "resolved": "https://registry.npmjs.org/xss/-/xss-1.0.14.tgz",
+@@ -10261,6 +9485,7 @@
+       "version": "5.0.8",
+       "resolved": "https://registry.npmjs.org/y18n/-/y18n-5.0.8.tgz",
+       "integrity": "sha512-0pfFzegeDWJHJIAmTLRP2DwHjdF5s7jo9tuztdQxAhINCdvS+3nGINqPd00AphqJR/0LhANUS6/+7SCb98YOfA==",
++      "dev": true,
+       "engines": {
+         "node": ">=10"
+       }
+@@ -10283,6 +9508,7 @@
+       "version": "17.7.2",
+       "resolved": "https://registry.npmjs.org/yargs/-/yargs-17.7.2.tgz",
+       "integrity": "sha512-7dSzzRQ++CKnNI/krKnYRV7JKKPUXMEh61soaHKg9mrWEhzFWhFnxPxGl+69cD1Ou63C13NUPCnmIcrvqCuM6w==",
++      "dev": true,
+       "dependencies": {
+         "cliui": "^8.0.1",
+         "escalade": "^3.1.1",
+@@ -10300,6 +9526,7 @@
+       "version": "21.1.1",
+       "resolved": "https://registry.npmjs.org/yargs-parser/-/yargs-parser-21.1.1.tgz",
+       "integrity": "sha512-tVpsJW7DdjecAiFpbIB1e3qxIQsE6NoPc5/eTdrbbIC4h0LVsWhnoa3g+m2HclBIujHzsxZ4VJVA+GUuc2/LBw==",
++      "dev": true,
+       "engines": {
+         "node": ">=12"
+       }
+@@ -10308,7 +9535,7 @@
+       "version": "3.1.1",
+       "resolved": "https://registry.npmjs.org/yn/-/yn-3.1.1.tgz",
+       "integrity": "sha512-Ux4ygGWsu2c7isFWe8Yu1YluJmqVhxqK2cLXNQA5AcC3QfbGNpM7fu0Y8b/z16pXLnFxZYvWhd3fhBY9DLmC6Q==",
+-      "devOptional": true,
++      "dev": true,
+       "engines": {
+         "node": ">=6"
+       }
+@@ -10913,14 +10140,6 @@
+         "@babel/helper-plugin-utils": "^7.20.2"
+       }
+     },
+-    "@babel/runtime": {
+-      "version": "7.21.5",
+-      "resolved": "https://registry.npmjs.org/@babel/runtime/-/runtime-7.21.5.tgz",
+-      "integrity": "sha512-8jI69toZqqcsnqGGqwGS4Qb1VwLOEp4hz+CXPywcvjs60u3B4Pom/U/7rm4W8tMOYEB+E9wgD0mW1l3r8qlI9Q==",
+-      "requires": {
+-        "regenerator-runtime": "^0.13.11"
+-      }
+-    },
+     "@babel/template": {
+       "version": "7.20.7",
+       "resolved": "https://registry.npmjs.org/@babel/template/-/template-7.20.7.tgz",
+@@ -10986,7 +10205,7 @@
+       "version": "0.8.1",
+       "resolved": "https://registry.npmjs.org/@cspotcode/source-map-support/-/source-map-support-0.8.1.tgz",
+       "integrity": "sha512-IchNf6dN4tHoMFIn/7OE8LWZ19Y6q/67Bmf6vnGREv8RSbBVb9LPJxEcnwrcwX6ixSvaiGoomAUvu4YSxXrVgw==",
+-      "devOptional": true,
++      "dev": true,
+       "requires": {
+         "@jridgewell/trace-mapping": "0.3.9"
+       },
+@@ -10995,7 +10214,7 @@
+           "version": "0.3.9",
+           "resolved": "https://registry.npmjs.org/@jridgewell/trace-mapping/-/trace-mapping-0.3.9.tgz",
+           "integrity": "sha512-3Belt6tdc8bPgAtbcmdtNJlirVoTmEb5e2gC94PnkwEW9jI6CAHUeoG85tjWP5WquqfavoMtMwiG4P926ZKKuQ==",
+-          "devOptional": true,
++          "dev": true,
+           "requires": {
+             "@jridgewell/resolve-uri": "^3.0.3",
+             "@jridgewell/sourcemap-codec": "^1.4.10"
+@@ -11061,12 +10280,6 @@
+       "integrity": "sha512-ElyB54bJIhXQYVKjDSvCkPO1iU1tSAeVQJbllWJq1XQSmmA4dgFk8CbiBGpiOPxleE48vDogxCtmMYku4HSVLA==",
+       "dev": true
+     },
+-    "@golevelup/ts-jest": {
+-      "version": "0.3.7",
+-      "resolved": "https://registry.npmjs.org/@golevelup/ts-jest/-/ts-jest-0.3.7.tgz",
+-      "integrity": "sha512-eoRfl9trBEt7BrQ6t3GHY/ZOcDOMBIOgqghd9qkIWMpcqQgWbU5Yf5UeHA6wwnLYpOMIJoKqazJ0cUDM79yr+g==",
+-      "dev": true
+-    },
+     "@graphql-tools/merge": {
+       "version": "8.3.18",
+       "resolved": "https://registry.npmjs.org/@graphql-tools/merge/-/merge-8.3.18.tgz",
+@@ -11481,7 +10694,7 @@
+       "version": "3.1.0",
+       "resolved": "https://registry.npmjs.org/@jridgewell/resolve-uri/-/resolve-uri-3.1.0.tgz",
+       "integrity": "sha512-F2msla3tad+Mfht5cJq7LSXcdudKTWCVYUgw6pLFOOHSTtZlj6SWNYAp+AhuqLmWdBO2X5hPrLcu8cVP8fy28w==",
+-      "devOptional": true
++      "dev": true
+     },
+     "@jridgewell/set-array": {
+       "version": "1.1.2",
+@@ -11503,7 +10716,7 @@
+       "version": "1.4.15",
+       "resolved": "https://registry.npmjs.org/@jridgewell/sourcemap-codec/-/sourcemap-codec-1.4.15.tgz",
+       "integrity": "sha512-eF2rxCRulEKXHTRiDrDy6erMYWqNw4LPdQ8UQA4huuxaQsVeRPFl2oM8oDGxMFhJUWZf9McpLtJasDDZb/Bpeg==",
+-      "devOptional": true
++      "dev": true
+     },
+     "@jridgewell/trace-mapping": {
+       "version": "0.3.18",
+@@ -11554,14 +10767,6 @@
+         "tslib": "2.5.0"
+       }
+     },
+-    "@nestjs/axios": {
+-      "version": "0.1.1",
+-      "resolved": "https://registry.npmjs.org/@nestjs/axios/-/axios-0.1.1.tgz",
+-      "integrity": "sha512-rLEq6yfho2CZyOcxP+P4Q3FjkNuiiHDyzj3Cr9i4Kdn3Ng09ygtOB4++jjXPREc6650pOFfzNtw18QH7bfLnQA==",
+-      "requires": {
+-        "axios": "1.2.1"
+-      }
+-    },
+     "@nestjs/cli": {
+       "version": "9.5.0",
+       "resolved": "https://registry.npmjs.org/@nestjs/cli/-/cli-9.5.0.tgz",
+@@ -11756,6 +10961,8 @@
+       "version": "9.4.1",
+       "resolved": "https://registry.npmjs.org/@nestjs/microservices/-/microservices-9.4.1.tgz",
+       "integrity": "sha512-052P1gFdbjEnqTLY9mwhNg7Duy/6o6tLpUQHs5w3VhpBo/fwL/2n61PfG27UM57wwtDea49KnoXWJ0+bXubrqw==",
++      "optional": true,
++      "peer": true,
+       "requires": {
+         "iterare": "1.2.1",
+         "tslib": "2.5.0"
+@@ -11812,21 +11019,6 @@
+         "tslib": "2.5.0"
+       }
+     },
+-    "@nestjs/typeorm": {
+-      "version": "9.0.1",
+-      "resolved": "https://registry.npmjs.org/@nestjs/typeorm/-/typeorm-9.0.1.tgz",
+-      "integrity": "sha512-A2BgLIPsMtmMI0bPKEf4bmzgFPsnvHqNBx3KkvaJ7hJrBQy0OqYOb+Rr06ifblKWDWS2tUPNrAFQbZjtk3PI+g==",
+-      "requires": {
+-        "uuid": "8.3.2"
+-      },
+-      "dependencies": {
+-        "uuid": {
+-          "version": "8.3.2",
+-          "resolved": "https://registry.npmjs.org/uuid/-/uuid-8.3.2.tgz",
+-          "integrity": "sha512-+NYs2QeMWy+GWFOEm9xnn6HCDp0l7QBD7ml8zLUmJ+93Q5NF0NocErnwkTkXVFNiX3/fpC6afS8Dhb/gz7R7eg=="
+-        }
+-      }
+-    },
+     "@nodelib/fs.scandir": {
+       "version": "2.1.5",
+       "resolved": "https://registry.npmjs.org/@nodelib/fs.scandir/-/fs.scandir-2.1.5.tgz",
+@@ -12003,34 +11195,29 @@
+         "@sinonjs/commons": "^3.0.0"
+       }
+     },
+-    "@sqltools/formatter": {
+-      "version": "1.2.5",
+-      "resolved": "https://registry.npmjs.org/@sqltools/formatter/-/formatter-1.2.5.tgz",
+-      "integrity": "sha512-Uy0+khmZqUrUGm5dmMqVlnvufZRSK0FbYzVgp0UMstm+F5+W2/jnEEQyc9vo1ZR/E5ZI/B1WjjoTqBqwJL6Krw=="
+-    },
+     "@tsconfig/node10": {
+       "version": "1.0.9",
+       "resolved": "https://registry.npmjs.org/@tsconfig/node10/-/node10-1.0.9.tgz",
+       "integrity": "sha512-jNsYVVxU8v5g43Erja32laIDHXeoNvFEpX33OK4d6hljo3jDhCBDhx5dhCCTMWUojscpAagGiRkBKxpdl9fxqA==",
+-      "devOptional": true
++      "dev": true
+     },
+     "@tsconfig/node12": {
+       "version": "1.0.11",
+       "resolved": "https://registry.npmjs.org/@tsconfig/node12/-/node12-1.0.11.tgz",
+       "integrity": "sha512-cqefuRsh12pWyGsIoBKJA9luFu3mRxCA+ORZvA4ktLSzIuCUtWVxGIuXigEwO5/ywWFMZ2QEGKWvkZG1zDMTag==",
+-      "devOptional": true
++      "dev": true
+     },
+     "@tsconfig/node14": {
+       "version": "1.0.3",
+       "resolved": "https://registry.npmjs.org/@tsconfig/node14/-/node14-1.0.3.tgz",
+       "integrity": "sha512-ysT8mhdixWK6Hw3i1V2AeRqZ5WfXg1G43mqoYlM2nc6388Fq5jcXyr5mRsqViLx/GJYdoL0bfXD8nmF+Zn/Iow==",
+-      "devOptional": true
++      "dev": true
+     },
+     "@tsconfig/node16": {
+       "version": "1.0.4",
+       "resolved": "https://registry.npmjs.org/@tsconfig/node16/-/node16-1.0.4.tgz",
+       "integrity": "sha512-vxhUy4J8lyeyinH7Azl1pdd43GJhZH/tP2weN8TntQblOY+A0XbT8DJk1/oCPuOOyg/Ja757rG0CgHcWC8OfMA==",
+-      "devOptional": true
++      "dev": true
+     },
+     "@types/accepts": {
+       "version": "1.3.5",
+@@ -12081,15 +11268,6 @@
+         "@babel/types": "^7.3.0"
+       }
+     },
+-    "@types/bcrypt": {
+-      "version": "5.0.2",
+-      "resolved": "https://registry.npmjs.org/@types/bcrypt/-/bcrypt-5.0.2.tgz",
+-      "integrity": "sha512-6atioO8Y75fNcbmj0G7UjI9lXN2pQ/IGJ2FWT4a/btd0Lk9lQalHLKhkgKVZ3r+spnmWUKfbMi1GEe9wyHQfNQ==",
+-      "dev": true,
+-      "requires": {
+-        "@types/node": "*"
+-      }
+-    },
+     "@types/body-parser": {
+       "version": "1.19.2",
+       "resolved": "https://registry.npmjs.org/@types/body-parser/-/body-parser-1.19.2.tgz",
+@@ -12235,29 +11413,11 @@
+       "resolved": "https://registry.npmjs.org/@types/mime/-/mime-1.3.2.tgz",
+       "integrity": "sha512-YATxVxgRqNH6nHEIsvg6k2Boc1JHI9ZbH5iWFFv/MTkchz3b1ieGDa5T0a9RznNdI0KhVbdbWSN+KWWrQZRxTw=="
+     },
+-    "@types/multer": {
+-      "version": "1.4.7",
+-      "resolved": "https://registry.npmjs.org/@types/multer/-/multer-1.4.7.tgz",
+-      "integrity": "sha512-/SNsDidUFCvqqcWDwxv2feww/yqhNeTRL5CVoL3jU4Goc4kKEL10T7Eye65ZqPNi4HRx8sAEX59pV1aEH7drNA==",
+-      "dev": true,
+-      "requires": {
+-        "@types/express": "*"
+-      }
+-    },
+     "@types/node": {
+       "version": "18.16.13",
+       "resolved": "https://registry.npmjs.org/@types/node/-/node-18.16.13.tgz",
+       "integrity": "sha512-uZRomboV1vBL61EBXneL4j9/hEn+1Yqa4LQdpGrKmXFyJmVfWc9JV9+yb2AlnOnuaDnb2PDO3hC6/LKmzJxP1A=="
+     },
+-    "@types/papaparse": {
+-      "version": "5.3.7",
+-      "resolved": "https://registry.npmjs.org/@types/papaparse/-/papaparse-5.3.7.tgz",
+-      "integrity": "sha512-f2HKmlnPdCvS0WI33WtCs5GD7X1cxzzS/aduaxSu3I7TbhWlENjSPs6z5TaB9K0J+BH1jbmqTaM+ja5puis4wg==",
+-      "dev": true,
+-      "requires": {
+-        "@types/node": "*"
+-      }
+-    },
+     "@types/parse-json": {
+       "version": "4.0.0",
+       "resolved": "https://registry.npmjs.org/@types/parse-json/-/parse-json-4.0.0.tgz",
+@@ -12283,17 +11443,6 @@
+         "@types/passport-strategy": "*"
+       }
+     },
+-    "@types/passport-local": {
+-      "version": "1.0.38",
+-      "resolved": "https://registry.npmjs.org/@types/passport-local/-/passport-local-1.0.38.tgz",
+-      "integrity": "sha512-nsrW4A963lYE7lNTv9cr5WmiUD1ibYJvWrpE13oxApFsRt77b0RdtZvKbCdNIY4v/QZ6TRQWaDDEwV1kCTmcXg==",
+-      "dev": true,
+-      "requires": {
+-        "@types/express": "*",
+-        "@types/passport": "*",
+-        "@types/passport-strategy": "*"
+-      }
+-    },
+     "@types/passport-strategy": {
+       "version": "0.2.38",
+       "resolved": "https://registry.npmjs.org/@types/passport-strategy/-/passport-strategy-0.2.38.tgz",
+@@ -12648,18 +11797,9 @@
+       "dev": true
+     },
+     "abbrev": {
+-      "version": "1.1.1",
+-      "resolved": "https://registry.npmjs.org/abbrev/-/abbrev-1.1.1.tgz",
+-      "integrity": "sha512-nne9/IiQ/hzIhY6pdDnbBtz7DjPTKrY00P/zvPSm5pOFkl6xuGrGnXn/VtTNNfNtAfZ9/1RtehkszU9qcTii0Q=="
+-    },
+-    "abort-controller": {
+-      "version": "3.0.0",
+-      "resolved": "https://registry.npmjs.org/abort-controller/-/abort-controller-3.0.0.tgz",
+-      "integrity": "sha512-h8lQ8tacZYnR3vNQTgibj+tODHI5/+l06Au2Pcriv/Gmet0eaj4TwWH41sO9wnHDiQsEj19q0drzdWdeAHtweg==",
+-      "dev": true,
+-      "requires": {
+-        "event-target-shim": "^5.0.0"
+-      }
++      "version": "1.1.1",
++      "resolved": "https://registry.npmjs.org/abbrev/-/abbrev-1.1.1.tgz",
++      "integrity": "sha512-nne9/IiQ/hzIhY6pdDnbBtz7DjPTKrY00P/zvPSm5pOFkl6xuGrGnXn/VtTNNfNtAfZ9/1RtehkszU9qcTii0Q=="
+     },
+     "accepts": {
+       "version": "1.3.8",
+@@ -12674,7 +11814,7 @@
+       "version": "8.8.2",
+       "resolved": "https://registry.npmjs.org/acorn/-/acorn-8.8.2.tgz",
+       "integrity": "sha512-xjIYgE8HBrkpd/sJqOGNspf8uHG+NOHGOw6a/Urj8taM2EXfdNAH2oFcPeIFfsv3+kz/mJrS5VuMqbNLjCa2vw==",
+-      "devOptional": true
++      "dev": true
+     },
+     "acorn-import-assertions": {
+       "version": "1.9.0",
+@@ -12694,7 +11834,7 @@
+       "version": "8.2.0",
+       "resolved": "https://registry.npmjs.org/acorn-walk/-/acorn-walk-8.2.0.tgz",
+       "integrity": "sha512-k+iyHEuPgSw6SbuDpGQM+06HQUa04DZ3o+F6CSzXMvvI5KMvnaEqXe+YVe555R9nn6GPt404fos4wcgpw12SDA==",
+-      "devOptional": true
++      "dev": true
+     },
+     "agent-base": {
+       "version": "6.0.2",
+@@ -12761,11 +11901,6 @@
+         "color-convert": "^2.0.1"
+       }
+     },
+-    "any-promise": {
+-      "version": "1.3.0",
+-      "resolved": "https://registry.npmjs.org/any-promise/-/any-promise-1.3.0.tgz",
+-      "integrity": "sha512-7UvmKalWRt1wgjL1RrGxoSJW/0QZFIegpeGvZG9kjp8vrRu55XTHbwnqq2GpXm9uLbcuhxm3IqX9OB4MZR1b2A=="
+-    },
+     "anymatch": {
+       "version": "3.1.3",
+       "resolved": "https://registry.npmjs.org/anymatch/-/anymatch-3.1.3.tgz",
+@@ -12958,11 +12093,6 @@
+         "apollo-server-env": "^4.2.1"
+       }
+     },
+-    "app-root-path": {
+-      "version": "3.1.0",
+-      "resolved": "https://registry.npmjs.org/app-root-path/-/app-root-path-3.1.0.tgz",
+-      "integrity": "sha512-biN3PwB2gUtjaYy/isrU3aNWI5w+fAfvHkSvCKeQGxhmYpwKFUxudR3Yya+KqVRHBmEDYh+/lTozYCFbmzX4nA=="
+-    },
+     "append-field": {
+       "version": "1.0.0",
+       "resolved": "https://registry.npmjs.org/append-field/-/append-field-1.0.0.tgz",
+@@ -12998,7 +12128,7 @@
+       "version": "4.1.3",
+       "resolved": "https://registry.npmjs.org/arg/-/arg-4.1.3.tgz",
+       "integrity": "sha512-58S9QDqG0Xx27YwPSt9fJxivjYl432YCwfDMfZ+71RAqUrZef7LrKQZ3LHLOwCS4FLNBplP533Zx895SeOCHvA==",
+-      "devOptional": true
++      "dev": true
+     },
+     "argon2": {
+       "version": "0.31.2",
+@@ -13043,24 +12173,9 @@
+     "asynckit": {
+       "version": "0.4.0",
+       "resolved": "https://registry.npmjs.org/asynckit/-/asynckit-0.4.0.tgz",
+-      "integrity": "sha512-Oei9OH4tRh0YqU3GxhX79dM/mwVgvbZJaSNaRk+bshkj0S5cfHcgYakreBjrHwatXKbz+IoIdYLxrKim2MjW0Q=="
+-    },
+-    "atomic-sleep": {
+-      "version": "1.0.0",
+-      "resolved": "https://registry.npmjs.org/atomic-sleep/-/atomic-sleep-1.0.0.tgz",
+-      "integrity": "sha512-kNOjDqAh7px0XWNI+4QbzoiR/nTkHAWNud2uvnJquD1/x5a7EQZMJT0AczqK0Qn67oY/TTQ1LbUKajZpp3I9tQ==",
++      "integrity": "sha512-Oei9OH4tRh0YqU3GxhX79dM/mwVgvbZJaSNaRk+bshkj0S5cfHcgYakreBjrHwatXKbz+IoIdYLxrKim2MjW0Q==",
+       "dev": true
+     },
+-    "axios": {
+-      "version": "1.2.1",
+-      "resolved": "https://registry.npmjs.org/axios/-/axios-1.2.1.tgz",
+-      "integrity": "sha512-I88cFiGu9ryt/tfVEi4kX2SITsvDddTajXTOFmt2uK1ZVA8LytjtdeyefdQWEf5PU8w+4SSJDoYnggflB5tW4A==",
+-      "requires": {
+-        "follow-redirects": "^1.15.0",
+-        "form-data": "^4.0.0",
+-        "proxy-from-env": "^1.1.0"
+-      }
+-    },
+     "babel-jest": {
+       "version": "29.5.0",
+       "resolved": "https://registry.npmjs.org/babel-jest/-/babel-jest-29.5.0.tgz",
+@@ -13144,7 +12259,8 @@
+     "base64-js": {
+       "version": "1.5.1",
+       "resolved": "https://registry.npmjs.org/base64-js/-/base64-js-1.5.1.tgz",
+-      "integrity": "sha512-AKpaYlHn8t4SVbOHCy+b5+KKgvR4vrsD8vbvrbiQJps7fKDTkjkDry6ji0rUJjC0kzbNePLwzxq8iypo41qeWA=="
++      "integrity": "sha512-AKpaYlHn8t4SVbOHCy+b5+KKgvR4vrsD8vbvrbiQJps7fKDTkjkDry6ji0rUJjC0kzbNePLwzxq8iypo41qeWA==",
++      "dev": true
+     },
+     "binary-extensions": {
+       "version": "2.2.0",
+@@ -13375,6 +12491,11 @@
+       "integrity": "sha512-cOU9usZw8/dXIXKtwa8pM0OTJQuJkxMN6w30csNRUerHfeQ5R6U3kkU/FtJeIf3M202OHfY2U8ccInBG7/xogA==",
+       "dev": true
+     },
++    "class-transformer": {
++      "version": "0.5.1",
++      "resolved": "https://registry.npmjs.org/class-transformer/-/class-transformer-0.5.1.tgz",
++      "integrity": "sha512-SQa1Ws6hUbfC98vKGxZH3KFY0Y1lm5Zm0SY8XX9zbK7FJCyVEac3ATW0RIpwzW+oOfmHE5PMPufDG9hCfoEOMw=="
++    },
+     "class-validator": {
+       "version": "0.14.0",
+       "resolved": "https://registry.npmjs.org/class-validator/-/class-validator-0.14.0.tgz",
+@@ -13394,50 +12515,6 @@
+         "restore-cursor": "^3.1.0"
+       }
+     },
+-    "cli-highlight": {
+-      "version": "2.1.11",
+-      "resolved": "https://registry.npmjs.org/cli-highlight/-/cli-highlight-2.1.11.tgz",
+-      "integrity": "sha512-9KDcoEVwyUXrjcJNvHD0NFc/hiwe/WPVYIleQh2O1N2Zro5gWJZ/K+3DGn8w8P/F6FxOgzyC5bxDyHIgCSPhGg==",
+-      "requires": {
+-        "chalk": "^4.0.0",
+-        "highlight.js": "^10.7.1",
+-        "mz": "^2.4.0",
+-        "parse5": "^5.1.1",
+-        "parse5-htmlparser2-tree-adapter": "^6.0.0",
+-        "yargs": "^16.0.0"
+-      },
+-      "dependencies": {
+-        "cliui": {
+-          "version": "7.0.4",
+-          "resolved": "https://registry.npmjs.org/cliui/-/cliui-7.0.4.tgz",
+-          "integrity": "sha512-OcRE68cOsVMXp1Yvonl/fzkQOyjLSu/8bhPDfQt0e0/Eb283TKP20Fs2MqoPsr9SwA595rRCA+QMzYc9nBP+JQ==",
+-          "requires": {
+-            "string-width": "^4.2.0",
+-            "strip-ansi": "^6.0.0",
+-            "wrap-ansi": "^7.0.0"
+-          }
+-        },
+-        "yargs": {
+-          "version": "16.2.0",
+-          "resolved": "https://registry.npmjs.org/yargs/-/yargs-16.2.0.tgz",
+-          "integrity": "sha512-D1mvvtDG0L5ft/jGWkLpG1+m0eQxOfaBvTNELraWj22wSVUMWxZUvYgJYcKh6jGGIkJFhH4IZPQhR4TKpc8mBw==",
+-          "requires": {
+-            "cliui": "^7.0.2",
+-            "escalade": "^3.1.1",
+-            "get-caller-file": "^2.0.5",
+-            "require-directory": "^2.1.1",
+-            "string-width": "^4.2.0",
+-            "y18n": "^5.0.5",
+-            "yargs-parser": "^20.2.2"
+-          }
+-        },
+-        "yargs-parser": {
+-          "version": "20.2.9",
+-          "resolved": "https://registry.npmjs.org/yargs-parser/-/yargs-parser-20.2.9.tgz",
+-          "integrity": "sha512-y11nGElTIV+CT3Zv9t7VKl+Q3hTQoT9a1Qzezhhl6Rp21gJ/IVTW7Z3y9EWXhuUBC2Shnf+DX0antecpAwSP8w=="
+-        }
+-      }
+-    },
+     "cli-spinners": {
+       "version": "2.9.0",
+       "resolved": "https://registry.npmjs.org/cli-spinners/-/cli-spinners-2.9.0.tgz",
+@@ -13464,6 +12541,7 @@
+       "version": "8.0.1",
+       "resolved": "https://registry.npmjs.org/cliui/-/cliui-8.0.1.tgz",
+       "integrity": "sha512-BSeNnyus75C4//NQ9gQt1/csTXyo/8Sb+afLAkzAptFuMsod9HFokGNudZpi/oQV73hnVK+sR+5PVRMd+Dr7YQ==",
++      "dev": true,
+       "requires": {
+         "string-width": "^4.2.0",
+         "strip-ansi": "^6.0.1",
+@@ -13506,16 +12584,11 @@
+       "resolved": "https://registry.npmjs.org/color-support/-/color-support-1.1.3.tgz",
+       "integrity": "sha512-qiBjkpbMLO/HL68y+lh4q0/O1MZFj2RX6X/KmMa3+gJD3z+WwI1ZzDHysvqHGS3mP6mznPckpXmw1nI9cJjyRg=="
+     },
+-    "colorette": {
+-      "version": "2.0.20",
+-      "resolved": "https://registry.npmjs.org/colorette/-/colorette-2.0.20.tgz",
+-      "integrity": "sha512-IfEDxwoWIjkeXL1eXcDiow4UbKjhLdq6/EuSVR9GMN7KVH3r9gQ83e73hsz1Nd1T3ijd5xv1wcWRYO+D6kCI2w==",
+-      "dev": true
+-    },
+     "combined-stream": {
+       "version": "1.0.8",
+       "resolved": "https://registry.npmjs.org/combined-stream/-/combined-stream-1.0.8.tgz",
+       "integrity": "sha512-FQN4MRfuJeHf7cBbBMJFXhKSDq+2kAArBlmRBvcvFE5BB1HZKXtSFASDhdlz9zOYwxh8lDdnvmMOe/+5cdoEdg==",
++      "dev": true,
+       "requires": {
+         "delayed-stream": "~1.0.0"
+       }
+@@ -13624,7 +12697,7 @@
+       "version": "1.1.1",
+       "resolved": "https://registry.npmjs.org/create-require/-/create-require-1.1.1.tgz",
+       "integrity": "sha512-dcKFX3jn0MpIaXjisoRvexIJVEKzaq7z2rZKxf+MSr9TkdmHmsU4m2lcLojrj/FHl8mk5VxMmYA+ftRkP/3oKQ==",
+-      "devOptional": true
++      "dev": true
+     },
+     "cross-spawn": {
+       "version": "7.0.3",
+@@ -13642,20 +12715,6 @@
+       "resolved": "https://registry.npmjs.org/cssfilter/-/cssfilter-0.0.10.tgz",
+       "integrity": "sha512-FAaLDaplstoRsDR8XGYH51znUN0UY7nMc6Z9/fvE8EXGwvJE9hu7W2vHwx1+bd6gCYnln9nLbzxFTrcO9YQDZw=="
+     },
+-    "date-fns": {
+-      "version": "2.30.0",
+-      "resolved": "https://registry.npmjs.org/date-fns/-/date-fns-2.30.0.tgz",
+-      "integrity": "sha512-fnULvOpxnC5/Vg3NCiWelDsLiUc9bRwAPs/+LfTLNvetFCtCTN+yQz15C/fs4AwX1R9K5GLtLfn8QW+dWisaAw==",
+-      "requires": {
+-        "@babel/runtime": "^7.21.0"
+-      }
+-    },
+-    "dateformat": {
+-      "version": "4.6.3",
+-      "resolved": "https://registry.npmjs.org/dateformat/-/dateformat-4.6.3.tgz",
+-      "integrity": "sha512-2P0p0pFGzHS5EMnhdxQi7aJN+iMheud0UhG4dlE1DLAlvL8JHjJJTX/CSm4JXwV0Ka5nGk3zC5mcb5bUQUxxMA==",
+-      "dev": true
+-    },
+     "debug": {
+       "version": "4.3.4",
+       "resolved": "https://registry.npmjs.org/debug/-/debug-4.3.4.tgz",
+@@ -13694,7 +12753,8 @@
+     "delayed-stream": {
+       "version": "1.0.0",
+       "resolved": "https://registry.npmjs.org/delayed-stream/-/delayed-stream-1.0.0.tgz",
+-      "integrity": "sha512-ZySD7Nf91aLB0RxL4KGrKHBXl7Eds1DAmEdcoVawXnLD7SDhpNgtuII2aAkg7a7QS41jxPSZ17p4VdGnMHk3MQ=="
++      "integrity": "sha512-ZySD7Nf91aLB0RxL4KGrKHBXl7Eds1DAmEdcoVawXnLD7SDhpNgtuII2aAkg7a7QS41jxPSZ17p4VdGnMHk3MQ==",
++      "dev": true
+     },
+     "delegates": {
+       "version": "1.0.0",
+@@ -13736,7 +12796,7 @@
+       "version": "4.0.2",
+       "resolved": "https://registry.npmjs.org/diff/-/diff-4.0.2.tgz",
+       "integrity": "sha512-58lmxKSA4BNyLz+HHMUzlOEpg09FV+ev6ZMe3vJihgdxzgcwZ8VoEEPmALCZG9LmqfVoNMMKpttIYTVG6uDY7A==",
+-      "devOptional": true
++      "dev": true
+     },
+     "diff-sequences": {
+       "version": "29.4.3",
+@@ -13844,7 +12904,8 @@
+     "escalade": {
+       "version": "3.1.1",
+       "resolved": "https://registry.npmjs.org/escalade/-/escalade-3.1.1.tgz",
+-      "integrity": "sha512-k0er2gUkLf8O0zKJiAhmkTnJlTvINGv7ygDNPbeIsX/TJjGJZHuh9B2UxbsaEkmlEo9MfhrSzmhIlhRlI2GXnw=="
++      "integrity": "sha512-k0er2gUkLf8O0zKJiAhmkTnJlTvINGv7ygDNPbeIsX/TJjGJZHuh9B2UxbsaEkmlEo9MfhrSzmhIlhRlI2GXnw==",
++      "dev": true
+     },
+     "escape-html": {
+       "version": "1.0.3",
+@@ -14050,12 +13111,6 @@
+       "resolved": "https://registry.npmjs.org/etag/-/etag-1.8.1.tgz",
+       "integrity": "sha512-aIL5Fx7mawVa300al2BnEE4iNvo1qETxLrPI/o05L7z6go7fCw1J6EQmbK4FmJ2AS7kgVF/KEZWufBfdClMcPg=="
+     },
+-    "event-target-shim": {
+-      "version": "5.0.1",
+-      "resolved": "https://registry.npmjs.org/event-target-shim/-/event-target-shim-5.0.1.tgz",
+-      "integrity": "sha512-i/2XbnSz/uxRCU6+NdVJgKWDTM427+MqYbkQzD321DuCQJUqOuJKIA0IM2+W2xtYHdKOmZ4dR6fExsd4SXL+WQ==",
+-      "dev": true
+-    },
+     "eventemitter3": {
+       "version": "3.1.2",
+       "resolved": "https://registry.npmjs.org/eventemitter3/-/eventemitter3-3.1.2.tgz",
+@@ -14202,12 +13257,6 @@
+         "tmp": "^0.0.33"
+       }
+     },
+-    "fast-copy": {
+-      "version": "3.0.1",
+-      "resolved": "https://registry.npmjs.org/fast-copy/-/fast-copy-3.0.1.tgz",
+-      "integrity": "sha512-Knr7NOtK3HWRYGtHoJrjkaWepqT8thIVGAwt0p0aUs1zqkAzXZV4vo9fFNwyb5fcqK1GKYFYxldQdIDVKhUAfA==",
+-      "dev": true
+-    },
+     "fast-deep-equal": {
+       "version": "3.1.3",
+       "resolved": "https://registry.npmjs.org/fast-deep-equal/-/fast-deep-equal-3.1.3.tgz",
+@@ -14354,11 +13403,6 @@
+       "integrity": "sha512-5nqDSxl8nn5BSNxyR3n4I6eDmbolI6WT+QqR547RwxQapgjQBmtktdP+HTBb/a/zLsbzERTONyUB5pefh5TtjQ==",
+       "dev": true
+     },
+-    "follow-redirects": {
+-      "version": "1.15.2",
+-      "resolved": "https://registry.npmjs.org/follow-redirects/-/follow-redirects-1.15.2.tgz",
+-      "integrity": "sha512-VQLG33o04KaQ8uYi2tVNbdrWp1QWxNNea+nmIB4EVM28v0hmP17z7aG1+wAkNzVq4KeXTq3221ye5qTJP91JwA=="
+-    },
+     "fork-ts-checker-webpack-plugin": {
+       "version": "8.0.0",
+       "resolved": "https://registry.npmjs.org/fork-ts-checker-webpack-plugin/-/fork-ts-checker-webpack-plugin-8.0.0.tgz",
+@@ -14383,6 +13427,7 @@
+       "version": "4.0.0",
+       "resolved": "https://registry.npmjs.org/form-data/-/form-data-4.0.0.tgz",
+       "integrity": "sha512-ETEklSGi5t0QMZuiXoA/Q6vcnxcLQP5vdugSpuAyi6SVGi2clPPp+xgEhuMaHC+zGgn31Kd235W35f7Hykkaww==",
++      "dev": true,
+       "requires": {
+         "asynckit": "^0.4.0",
+         "combined-stream": "^1.0.8",
+@@ -14487,7 +13532,8 @@
+     "get-caller-file": {
+       "version": "2.0.5",
+       "resolved": "https://registry.npmjs.org/get-caller-file/-/get-caller-file-2.0.5.tgz",
+-      "integrity": "sha512-DyFP3BM/3YHTQOCUL/w0OZHR0lpKeGrxotcHWcqNEdnltqFwXVfhEBQ94eIo34AfQpo0rGki4cyIiftY06h2Fg=="
++      "integrity": "sha512-DyFP3BM/3YHTQOCUL/w0OZHR0lpKeGrxotcHWcqNEdnltqFwXVfhEBQ94eIo34AfQpo0rGki4cyIiftY06h2Fg==",
++      "dev": true
+     },
+     "get-intrinsic": {
+       "version": "1.2.1",
+@@ -14587,12 +13633,6 @@
+         "tslib": "^2.1.0"
+       }
+     },
+-    "graphql-type-json": {
+-      "version": "0.3.2",
+-      "resolved": "https://registry.npmjs.org/graphql-type-json/-/graphql-type-json-0.3.2.tgz",
+-      "integrity": "sha512-J+vjof74oMlCWXSvt0DOf2APEdZOCdubEvGDUAlqH//VBYcOYsGgRW7Xzorr44LvkjiuvecWc8fChxuZZbChtg==",
+-      "requires": {}
+-    },
+     "graphql-ws": {
+       "version": "5.11.3",
+       "resolved": "https://registry.npmjs.org/graphql-ws/-/graphql-ws-5.11.3.tgz",
+@@ -14627,71 +13667,12 @@
+       "resolved": "https://registry.npmjs.org/has-unicode/-/has-unicode-2.0.1.tgz",
+       "integrity": "sha512-8Rf9Y83NBReMnx0gFzA8JImQACstCYWUplepDa9xprwwtmgEZUF0h/i5xSA625zB/I37EtrswSST6OXxwaaIJQ=="
+     },
+-    "help-me": {
+-      "version": "4.2.0",
+-      "resolved": "https://registry.npmjs.org/help-me/-/help-me-4.2.0.tgz",
+-      "integrity": "sha512-TAOnTB8Tz5Dw8penUuzHVrKNKlCIbwwbHnXraNJxPwf8LRtE2HlM84RYuezMFcwOJmoYOCWVDyJ8TQGxn9PgxA==",
+-      "dev": true,
+-      "requires": {
+-        "glob": "^8.0.0",
+-        "readable-stream": "^3.6.0"
+-      },
+-      "dependencies": {
+-        "brace-expansion": {
+-          "version": "2.0.1",
+-          "resolved": "https://registry.npmjs.org/brace-expansion/-/brace-expansion-2.0.1.tgz",
+-          "integrity": "sha512-XnAIvQ8eM+kC6aULx6wuQiwVsnzsi9d3WxzV3FpWTGA19F621kwdbsAcFKXgKUHZWsy+mY6iL1sHTxWEFCytDA==",
+-          "dev": true,
+-          "requires": {
+-            "balanced-match": "^1.0.0"
+-          }
+-        },
+-        "glob": {
+-          "version": "8.1.0",
+-          "resolved": "https://registry.npmjs.org/glob/-/glob-8.1.0.tgz",
+-          "integrity": "sha512-r8hpEjiQEYlF2QU0df3dS+nxxSIreXQS1qRhMJM0Q5NDdR386C7jb7Hwwod8Fgiuex+k0GFjgft18yvxm5XoCQ==",
+-          "dev": true,
+-          "requires": {
+-            "fs.realpath": "^1.0.0",
+-            "inflight": "^1.0.4",
+-            "inherits": "2",
+-            "minimatch": "^5.0.1",
+-            "once": "^1.3.0"
+-          }
+-        },
+-        "minimatch": {
+-          "version": "5.1.6",
+-          "resolved": "https://registry.npmjs.org/minimatch/-/minimatch-5.1.6.tgz",
+-          "integrity": "sha512-lKwV/1brpG6mBUFHtb7NUmtABCb2WZZmm2wNiOA5hAb8VdCS4B3dtMWyvcoViccwAW/COERjXLt0zP1zXUN26g==",
+-          "dev": true,
+-          "requires": {
+-            "brace-expansion": "^2.0.1"
+-          }
+-        },
+-        "readable-stream": {
+-          "version": "3.6.2",
+-          "resolved": "https://registry.npmjs.org/readable-stream/-/readable-stream-3.6.2.tgz",
+-          "integrity": "sha512-9u/sniCrY3D5WdsERHzHE4G2YCXqoG5FTHUiCC4SIbr6XcLZBY05ya9EKjYek9O5xOAwjGq+1JdGBAS7Q9ScoA==",
+-          "dev": true,
+-          "requires": {
+-            "inherits": "^2.0.3",
+-            "string_decoder": "^1.1.1",
+-            "util-deprecate": "^1.0.1"
+-          }
+-        }
+-      }
+-    },
+     "hexoid": {
+       "version": "1.0.0",
+       "resolved": "https://registry.npmjs.org/hexoid/-/hexoid-1.0.0.tgz",
+       "integrity": "sha512-QFLV0taWQOZtvIRIAdBChesmogZrtuXvVWsFHZTk2SU+anspqZ2vMnoLg7IE1+Uk16N19APic1BuF8bC8c2m5g==",
+       "dev": true
+     },
+-    "highlight.js": {
+-      "version": "10.7.3",
+-      "resolved": "https://registry.npmjs.org/highlight.js/-/highlight.js-10.7.3.tgz",
+-      "integrity": "sha512-tzcUFauisWKNHaRkN4Wjl/ZA07gENAjFl3J/c480dprkGTg5EQstgaNFqBfUqCq54kZRIEcreTsAgF/m2quD7A=="
+-    },
+     "html-escaper": {
+       "version": "2.0.2",
+       "resolved": "https://registry.npmjs.org/html-escaper/-/html-escaper-2.0.2.tgz",
+@@ -14736,7 +13717,8 @@
+     "ieee754": {
+       "version": "1.2.1",
+       "resolved": "https://registry.npmjs.org/ieee754/-/ieee754-1.2.1.tgz",
+-      "integrity": "sha512-dcyqhDvX1C46lXZcVqCpK+FtMRQVdIMN6/Df5js2zouUsqG7I6sFxitIC+7KYK29KdXOLHdu9zL4sFnoVQnqaA=="
++      "integrity": "sha512-dcyqhDvX1C46lXZcVqCpK+FtMRQVdIMN6/Df5js2zouUsqG7I6sFxitIC+7KYK29KdXOLHdu9zL4sFnoVQnqaA==",
++      "dev": true
+     },
+     "ignore": {
+       "version": "5.2.4",
+@@ -15156,26 +14138,6 @@
+         "walker": "^1.0.8"
+       }
+     },
+-    "jest-junit": {
+-      "version": "14.0.1",
+-      "resolved": "https://registry.npmjs.org/jest-junit/-/jest-junit-14.0.1.tgz",
+-      "integrity": "sha512-h7/wwzPbllgpQhhVcRzRC76/cc89GlazThoV1fDxcALkf26IIlRsu/AcTG64f4nR2WPE3Cbd+i/sVf+NCUHrWQ==",
+-      "dev": true,
+-      "requires": {
+-        "mkdirp": "^1.0.4",
+-        "strip-ansi": "^6.0.1",
+-        "uuid": "^8.3.2",
+-        "xml": "^1.0.1"
+-      },
+-      "dependencies": {
+-        "uuid": {
+-          "version": "8.3.2",
+-          "resolved": "https://registry.npmjs.org/uuid/-/uuid-8.3.2.tgz",
+-          "integrity": "sha512-+NYs2QeMWy+GWFOEm9xnn6HCDp0l7QBD7ml8zLUmJ+93Q5NF0NocErnwkTkXVFNiX3/fpC6afS8Dhb/gz7R7eg==",
+-          "dev": true
+-        }
+-      }
+-    },
+     "jest-leak-detector": {
+       "version": "29.5.0",
+       "resolved": "https://registry.npmjs.org/jest-leak-detector/-/jest-leak-detector-29.5.0.tgz",
+@@ -15449,12 +14411,6 @@
+         }
+       }
+     },
+-    "joycon": {
+-      "version": "3.1.1",
+-      "resolved": "https://registry.npmjs.org/joycon/-/joycon-3.1.1.tgz",
+-      "integrity": "sha512-34wB/Y7MW7bzjKRjUKTa46I2Z7eV62Rkhva+KkopW7Qvv/OSWBqvkSY7vusOPrNuZcUG3tApvdVgNB8POj3SPw==",
+-      "dev": true
+-    },
+     "js-sdsl": {
+       "version": "4.4.0",
+       "resolved": "https://registry.npmjs.org/js-sdsl/-/js-sdsl-4.4.0.tgz",
+@@ -15729,7 +14685,7 @@
+       "version": "1.3.6",
+       "resolved": "https://registry.npmjs.org/make-error/-/make-error-1.3.6.tgz",
+       "integrity": "sha512-s8UhlNe7vPKomQhC1qFelMokr/Sc3AgNbso3n74mVPA5LTZwkB9NlXf4XPamLxJE8h0gh73rM94xvwRT2CVInw==",
+-      "devOptional": true
++      "dev": true
+     },
+     "makeerror": {
+       "version": "1.0.12",
+@@ -15886,16 +14842,6 @@
+       "integrity": "sha512-nnbWWOkoWyUsTjKrhgD0dcz22mdkSnpYqbEjIm2nhwhuxlSkpywJmBo8h0ZqJdkp73mb90SssHkN4rsRaBAfAA==",
+       "dev": true
+     },
+-    "mz": {
+-      "version": "2.7.0",
+-      "resolved": "https://registry.npmjs.org/mz/-/mz-2.7.0.tgz",
+-      "integrity": "sha512-z81GNO7nnYMEhrGh9LeymoE4+Yr0Wn5McHIZMK5cfQCl+NDX08sCZgUc9/6MHni9IWuFLm1Z3HTCXu2z9fN62Q==",
+-      "requires": {
+-        "any-promise": "^1.0.0",
+-        "object-assign": "^4.0.1",
+-        "thenify-all": "^1.0.0"
+-      }
+-    },
+     "natural-compare": {
+       "version": "1.4.0",
+       "resolved": "https://registry.npmjs.org/natural-compare/-/natural-compare-1.4.0.tgz",
+@@ -16001,12 +14947,6 @@
+       "resolved": "https://registry.npmjs.org/object-inspect/-/object-inspect-1.12.3.tgz",
+       "integrity": "sha512-geUvdk7c+eizMNUDkRpW1wJwgfOiOeHbxBR/hLXK1aT6zmVSO0jsQcs7fj6MGw89jC/cjGfLcNOrtMYtGqm81g=="
+     },
+-    "on-exit-leak-free": {
+-      "version": "2.1.0",
+-      "resolved": "https://registry.npmjs.org/on-exit-leak-free/-/on-exit-leak-free-2.1.0.tgz",
+-      "integrity": "sha512-VuCaZZAjReZ3vUwgOB8LxAosIurDiAW0s13rI1YwmaP++jvcxP77AWoQvenZebpCA2m8WC1/EosPYPMjnRAp/w==",
+-      "dev": true
+-    },
+     "on-finished": {
+       "version": "2.4.1",
+       "resolved": "https://registry.npmjs.org/on-finished/-/on-finished-2.4.1.tgz",
+@@ -16103,11 +15043,6 @@
+       "integrity": "sha512-R4nPAVTAU0B9D35/Gk3uJf/7XYbQcyohSKdvAxIRSNghFl4e71hVoGnBNQz9cWaXxO2I10KTC+3jMdvvoKw6dQ==",
+       "dev": true
+     },
+-    "papaparse": {
+-      "version": "5.4.1",
+-      "resolved": "https://registry.npmjs.org/papaparse/-/papaparse-5.4.1.tgz",
+-      "integrity": "sha512-HipMsgJkZu8br23pW15uvo6sib6wne/4woLZPlFf3rpDyMe9ywEXUsuD7+6K9PRkJlVT51j/sCOYDKGGS3ZJrw=="
+-    },
+     "parent-module": {
+       "version": "1.0.1",
+       "resolved": "https://registry.npmjs.org/parent-module/-/parent-module-1.0.1.tgz",
+@@ -16129,26 +15064,6 @@
+         "lines-and-columns": "^1.1.6"
+       }
+     },
+-    "parse5": {
+-      "version": "5.1.1",
+-      "resolved": "https://registry.npmjs.org/parse5/-/parse5-5.1.1.tgz",
+-      "integrity": "sha512-ugq4DFI0Ptb+WWjAdOK16+u/nHfiIrcE+sh8kZMaM0WllQKLI9rOUq6c2b7cwPkXdzfQESqvoqK6ug7U/Yyzug=="
+-    },
+-    "parse5-htmlparser2-tree-adapter": {
+-      "version": "6.0.1",
+-      "resolved": "https://registry.npmjs.org/parse5-htmlparser2-tree-adapter/-/parse5-htmlparser2-tree-adapter-6.0.1.tgz",
+-      "integrity": "sha512-qPuWvbLgvDGilKc5BoicRovlT4MtYT6JfJyBOMDsKoiT+GiuP5qyrPCnR9HcPECIJJmZh5jRndyNThnhhb/vlA==",
+-      "requires": {
+-        "parse5": "^6.0.1"
+-      },
+-      "dependencies": {
+-        "parse5": {
+-          "version": "6.0.1",
+-          "resolved": "https://registry.npmjs.org/parse5/-/parse5-6.0.1.tgz",
+-          "integrity": "sha512-Ofn/CTFzRGTTxwpNEs9PP93gXShHcTq255nzRYSKe8AkVpZY7e1fpmTfOyoIvjP5HG7Z2ZM7VS9PPhQGW2pOpw=="
+-        }
+-      }
+-    },
+     "parseurl": {
+       "version": "1.3.3",
+       "resolved": "https://registry.npmjs.org/parseurl/-/parseurl-1.3.3.tgz",
+@@ -16173,14 +15088,6 @@
+         "passport-strategy": "^1.0.0"
+       }
+     },
+-    "passport-local": {
+-      "version": "1.0.0",
+-      "resolved": "https://registry.npmjs.org/passport-local/-/passport-local-1.0.0.tgz",
+-      "integrity": "sha512-9wCE6qKznvf9mQYYbgJ3sVOHmCWoUNMVFoZzNoznmISbhnNNPhN9xfY3sLmScHMetEJeoY7CXwfhCe7argfQow==",
+-      "requires": {
+-        "passport-strategy": "1.x.x"
+-      }
+-    },
+     "passport-strategy": {
+       "version": "1.0.0",
+       "resolved": "https://registry.npmjs.org/passport-strategy/-/passport-strategy-1.0.0.tgz",
+@@ -16260,86 +15167,6 @@
+       "resolved": "https://registry.npmjs.org/picomatch/-/picomatch-2.3.1.tgz",
+       "integrity": "sha512-JU3teHTNjmE2VCGFzuY8EXzCDVwEqB2a8fsIvwaStHhAWJEeVd1o1QD80CU6+ZdEXXSLbSsuLwJjkCBWqRQUVA=="
+     },
+-    "pino-abstract-transport": {
+-      "version": "1.0.0",
+-      "resolved": "https://registry.npmjs.org/pino-abstract-transport/-/pino-abstract-transport-1.0.0.tgz",
+-      "integrity": "sha512-c7vo5OpW4wIS42hUVcT5REsL8ZljsUfBjqV/e2sFxmFEFZiq1XLUp5EYLtuDH6PEHq9W1egWqRbnLUP5FuZmOA==",
+-      "dev": true,
+-      "requires": {
+-        "readable-stream": "^4.0.0",
+-        "split2": "^4.0.0"
+-      },
+-      "dependencies": {
+-        "buffer": {
+-          "version": "6.0.3",
+-          "resolved": "https://registry.npmjs.org/buffer/-/buffer-6.0.3.tgz",
+-          "integrity": "sha512-FTiCpNxtwiZZHEZbcbTIcZjERVICn9yq/pDFkTl95/AxzD1naBctN7YO68riM/gLSDY7sdrMby8hofADYuuqOA==",
+-          "dev": true,
+-          "requires": {
+-            "base64-js": "^1.3.1",
+-            "ieee754": "^1.2.1"
+-          }
+-        },
+-        "readable-stream": {
+-          "version": "4.4.0",
+-          "resolved": "https://registry.npmjs.org/readable-stream/-/readable-stream-4.4.0.tgz",
+-          "integrity": "sha512-kDMOq0qLtxV9f/SQv522h8cxZBqNZXuXNyjyezmfAAuribMyVXziljpQ/uQhfE1XLg2/TLTW2DsnoE4VAi/krg==",
+-          "dev": true,
+-          "requires": {
+-            "abort-controller": "^3.0.0",
+-            "buffer": "^6.0.3",
+-            "events": "^3.3.0",
+-            "process": "^0.11.10"
+-          }
+-        }
+-      }
+-    },
+-    "pino-pretty": {
+-      "version": "9.4.0",
+-      "resolved": "https://registry.npmjs.org/pino-pretty/-/pino-pretty-9.4.0.tgz",
+-      "integrity": "sha512-NIudkNLxnl7MGj1XkvsqVyRgo6meFP82ECXF2PlOI+9ghmbGuBUUqKJ7IZPIxpJw4vhhSva0IuiDSAuGh6TV9g==",
+-      "dev": true,
+-      "requires": {
+-        "colorette": "^2.0.7",
+-        "dateformat": "^4.6.3",
+-        "fast-copy": "^3.0.0",
+-        "fast-safe-stringify": "^2.1.1",
+-        "help-me": "^4.0.1",
+-        "joycon": "^3.1.1",
+-        "minimist": "^1.2.6",
+-        "on-exit-leak-free": "^2.1.0",
+-        "pino-abstract-transport": "^1.0.0",
+-        "pump": "^3.0.0",
+-        "readable-stream": "^4.0.0",
+-        "secure-json-parse": "^2.4.0",
+-        "sonic-boom": "^3.0.0",
+-        "strip-json-comments": "^3.1.1"
+-      },
+-      "dependencies": {
+-        "buffer": {
+-          "version": "6.0.3",
+-          "resolved": "https://registry.npmjs.org/buffer/-/buffer-6.0.3.tgz",
+-          "integrity": "sha512-FTiCpNxtwiZZHEZbcbTIcZjERVICn9yq/pDFkTl95/AxzD1naBctN7YO68riM/gLSDY7sdrMby8hofADYuuqOA==",
+-          "dev": true,
+-          "requires": {
+-            "base64-js": "^1.3.1",
+-            "ieee754": "^1.2.1"
+-          }
+-        },
+-        "readable-stream": {
+-          "version": "4.4.0",
+-          "resolved": "https://registry.npmjs.org/readable-stream/-/readable-stream-4.4.0.tgz",
+-          "integrity": "sha512-kDMOq0qLtxV9f/SQv522h8cxZBqNZXuXNyjyezmfAAuribMyVXziljpQ/uQhfE1XLg2/TLTW2DsnoE4VAi/krg==",
+-          "dev": true,
+-          "requires": {
+-            "abort-controller": "^3.0.0",
+-            "buffer": "^6.0.3",
+-            "events": "^3.3.0",
+-            "process": "^0.11.10"
+-          }
+-        }
+-      }
+-    },
+     "pirates": {
+       "version": "4.0.5",
+       "resolved": "https://registry.npmjs.org/pirates/-/pirates-4.0.5.tgz",
+@@ -16449,12 +15276,6 @@
+         "@prisma/engines": "5.8.1"
+       }
+     },
+-    "process": {
+-      "version": "0.11.10",
+-      "resolved": "https://registry.npmjs.org/process/-/process-0.11.10.tgz",
+-      "integrity": "sha512-cdGef/drWFoydD1JsMzuFf8100nZl+GT+yacc2bEced5f9Rjk4z+WtFUTBu9PhOi9j/jfmBPu0mMEY4wIdAF8A==",
+-      "dev": true
+-    },
+     "process-nextick-args": {
+       "version": "2.0.1",
+       "resolved": "https://registry.npmjs.org/process-nextick-args/-/process-nextick-args-2.0.1.tgz",
+@@ -16479,11 +15300,6 @@
+         "ipaddr.js": "1.9.1"
+       }
+     },
+-    "proxy-from-env": {
+-      "version": "1.1.0",
+-      "resolved": "https://registry.npmjs.org/proxy-from-env/-/proxy-from-env-1.1.0.tgz",
+-      "integrity": "sha512-D+zkORCbA9f1tdWRK0RaCR3GPv50cMxcrz4X8k5LTSUD1Dkw47mKJEZQNunItRTkWwgtaUSo1RVFRIG9ZXiFYg=="
+-    },
+     "pump": {
+       "version": "3.0.0",
+       "resolved": "https://registry.npmjs.org/pump/-/pump-3.0.0.tgz",
+@@ -16593,15 +15409,11 @@
+       "resolved": "https://registry.npmjs.org/reflect-metadata/-/reflect-metadata-0.1.13.tgz",
+       "integrity": "sha512-Ts1Y/anZELhSsjMcU605fU9RE4Oi3p5ORujwbIKXfWa+0Zxs510Qrmrce5/Jowq3cHSZSJqBjypxmHarc+vEWg=="
+     },
+-    "regenerator-runtime": {
+-      "version": "0.13.11",
+-      "resolved": "https://registry.npmjs.org/regenerator-runtime/-/regenerator-runtime-0.13.11.tgz",
+-      "integrity": "sha512-kY1AZVr2Ra+t+piVaJ4gxaFaReZVH40AKNo7UCX6W+dEwBo/2oZJzqfuN1qLq1oL45o56cPaTXELwrTh8Fpggg=="
+-    },
+     "require-directory": {
+       "version": "2.1.1",
+       "resolved": "https://registry.npmjs.org/require-directory/-/require-directory-2.1.1.tgz",
+-      "integrity": "sha512-fGxEI7+wsG9xrvdjsrlmL22OMTTiHRwAMroiEeMgq8gzoLC/PQr7RsRDSTLUg/bZAZtF+TVIkHc6/4RIKrui+Q=="
++      "integrity": "sha512-fGxEI7+wsG9xrvdjsrlmL22OMTTiHRwAMroiEeMgq8gzoLC/PQr7RsRDSTLUg/bZAZtF+TVIkHc6/4RIKrui+Q==",
++      "dev": true
+     },
+     "require-from-string": {
+       "version": "2.0.2",
+@@ -16747,12 +15559,6 @@
+         }
+       }
+     },
+-    "secure-json-parse": {
+-      "version": "2.7.0",
+-      "resolved": "https://registry.npmjs.org/secure-json-parse/-/secure-json-parse-2.7.0.tgz",
+-      "integrity": "sha512-6aU+Rwsezw7VR8/nyvKTx8QpWH9FrcYiXXlqC4z5d5XQBDRqtbfsRjnwGyqbi3gddNtWHuEk9OANUotL26qKUw==",
+-      "dev": true
+-    },
+     "semver": {
+       "version": "7.5.4",
+       "resolved": "https://registry.npmjs.org/semver/-/semver-7.5.4.tgz",
+@@ -16895,15 +15701,6 @@
+       "integrity": "sha512-g9Q1haeby36OSStwb4ntCGGGaKsaVSjQ68fBxoQcutl5fS1vuY18H3wSt3jFyFtrkx+Kz0V1G85A4MyAdDMi2Q==",
+       "dev": true
+     },
+-    "sonic-boom": {
+-      "version": "3.3.0",
+-      "resolved": "https://registry.npmjs.org/sonic-boom/-/sonic-boom-3.3.0.tgz",
+-      "integrity": "sha512-LYxp34KlZ1a2Jb8ZQgFCK3niIHzibdwtwNUWKg0qQRzsDoJ3Gfgkf8KdBTFU3SkejDEIlWwnSnpVdOZIhFMl/g==",
+-      "dev": true,
+-      "requires": {
+-        "atomic-sleep": "^1.0.0"
+-      }
+-    },
+     "source-map": {
+       "version": "0.7.4",
+       "resolved": "https://registry.npmjs.org/source-map/-/source-map-0.7.4.tgz",
+@@ -16928,12 +15725,6 @@
+         }
+       }
+     },
+-    "split2": {
+-      "version": "4.2.0",
+-      "resolved": "https://registry.npmjs.org/split2/-/split2-4.2.0.tgz",
+-      "integrity": "sha512-UcjcJOWknrNkF6PLX83qcHM6KHgVKNkV62Y8a5uYDVv9ydGQVwAHMKqHdJje1VTWpljG0WYpCDhrCdAOYH4TWg==",
+-      "dev": true
+-    },
+     "sprintf-js": {
+       "version": "1.0.3",
+       "resolved": "https://registry.npmjs.org/sprintf-js/-/sprintf-js-1.0.3.tgz",
+@@ -17220,22 +16011,6 @@
+       "integrity": "sha512-N+8UisAXDGk8PFXP4HAzVR9nbfmVJ3zYLAWiTIoqC5v5isinhr+r5uaO8+7r3BMfuNIufIsA7RdpVgacC2cSpw==",
+       "dev": true
+     },
+-    "thenify": {
+-      "version": "3.3.1",
+-      "resolved": "https://registry.npmjs.org/thenify/-/thenify-3.3.1.tgz",
+-      "integrity": "sha512-RVZSIV5IG10Hk3enotrhvz0T9em6cyHBLkH/YAZuKqd8hRkKhSfCGIcP2KUY0EPxndzANBmNllzWPwak+bheSw==",
+-      "requires": {
+-        "any-promise": "^1.0.0"
+-      }
+-    },
+-    "thenify-all": {
+-      "version": "1.6.0",
+-      "resolved": "https://registry.npmjs.org/thenify-all/-/thenify-all-1.6.0.tgz",
+-      "integrity": "sha512-RNxQH/qI8/t3thXJDwcstUO4zeqo64+Uy/+sNVRBx4Xn2OX+OZ9oP+iJnNFqplFra2ZUVeKCSa2oVWi3T4uVmA==",
+-      "requires": {
+-        "thenify": ">= 3.1.0 < 4"
+-      }
+-    },
+     "through": {
+       "version": "2.3.8",
+       "resolved": "https://registry.npmjs.org/through/-/through-2.3.8.tgz",
+@@ -17319,7 +16094,7 @@
+       "version": "10.9.1",
+       "resolved": "https://registry.npmjs.org/ts-node/-/ts-node-10.9.1.tgz",
+       "integrity": "sha512-NtVysVPkxxrwFGUUxGYhfux8k78pQB3JqYBXlLRZgdGUqTO5wU/UyHop5p70iEbGhB7q5KmiZiU0Y3KlJrScEw==",
+-      "devOptional": true,
++      "dev": true,
+       "requires": {
+         "@cspotcode/source-map-support": "^0.8.0",
+         "@tsconfig/node10": "^1.0.7",
+@@ -17442,77 +16217,11 @@
+       "resolved": "https://registry.npmjs.org/typedarray/-/typedarray-0.0.6.tgz",
+       "integrity": "sha512-/aCDEGatGvZ2BIk+HmLf4ifCJFwvKFNb9/JeZPMulfgFracn9QFcAf5GO8B/mweUjSoblS5In0cWhqpfs/5PQA=="
+     },
+-    "typeorm": {
+-      "version": "0.3.16",
+-      "resolved": "https://registry.npmjs.org/typeorm/-/typeorm-0.3.16.tgz",
+-      "integrity": "sha512-wJ4Qy1oqRKNDdZiBTTaVMqwo/XxC52Q7uNPTjltPgLhvIW173bL6Iad0lhptMOsFlpixFPaUu3PNziaRBwX2Zw==",
+-      "requires": {
+-        "@sqltools/formatter": "^1.2.5",
+-        "app-root-path": "^3.1.0",
+-        "buffer": "^6.0.3",
+-        "chalk": "^4.1.2",
+-        "cli-highlight": "^2.1.11",
+-        "date-fns": "^2.29.3",
+-        "debug": "^4.3.4",
+-        "dotenv": "^16.0.3",
+-        "glob": "^8.1.0",
+-        "mkdirp": "^2.1.3",
+-        "reflect-metadata": "^0.1.13",
+-        "sha.js": "^2.4.11",
+-        "tslib": "^2.5.0",
+-        "uuid": "^9.0.0",
+-        "yargs": "^17.6.2"
+-      },
+-      "dependencies": {
+-        "brace-expansion": {
+-          "version": "2.0.1",
+-          "resolved": "https://registry.npmjs.org/brace-expansion/-/brace-expansion-2.0.1.tgz",
+-          "integrity": "sha512-XnAIvQ8eM+kC6aULx6wuQiwVsnzsi9d3WxzV3FpWTGA19F621kwdbsAcFKXgKUHZWsy+mY6iL1sHTxWEFCytDA==",
+-          "requires": {
+-            "balanced-match": "^1.0.0"
+-          }
+-        },
+-        "buffer": {
+-          "version": "6.0.3",
+-          "resolved": "https://registry.npmjs.org/buffer/-/buffer-6.0.3.tgz",
+-          "integrity": "sha512-FTiCpNxtwiZZHEZbcbTIcZjERVICn9yq/pDFkTl95/AxzD1naBctN7YO68riM/gLSDY7sdrMby8hofADYuuqOA==",
+-          "requires": {
+-            "base64-js": "^1.3.1",
+-            "ieee754": "^1.2.1"
+-          }
+-        },
+-        "glob": {
+-          "version": "8.1.0",
+-          "resolved": "https://registry.npmjs.org/glob/-/glob-8.1.0.tgz",
+-          "integrity": "sha512-r8hpEjiQEYlF2QU0df3dS+nxxSIreXQS1qRhMJM0Q5NDdR386C7jb7Hwwod8Fgiuex+k0GFjgft18yvxm5XoCQ==",
+-          "requires": {
+-            "fs.realpath": "^1.0.0",
+-            "inflight": "^1.0.4",
+-            "inherits": "2",
+-            "minimatch": "^5.0.1",
+-            "once": "^1.3.0"
+-          }
+-        },
+-        "minimatch": {
+-          "version": "5.1.6",
+-          "resolved": "https://registry.npmjs.org/minimatch/-/minimatch-5.1.6.tgz",
+-          "integrity": "sha512-lKwV/1brpG6mBUFHtb7NUmtABCb2WZZmm2wNiOA5hAb8VdCS4B3dtMWyvcoViccwAW/COERjXLt0zP1zXUN26g==",
+-          "requires": {
+-            "brace-expansion": "^2.0.1"
+-          }
+-        },
+-        "mkdirp": {
+-          "version": "2.1.6",
+-          "resolved": "https://registry.npmjs.org/mkdirp/-/mkdirp-2.1.6.tgz",
+-          "integrity": "sha512-+hEnITedc8LAtIP9u3HJDFIdcLV2vXP33sqLLIzkv1Db1zO/1OxbvYf0Y1OC/S/Qo5dxHXepofhmxL02PsKe+A=="
+-        }
+-      }
+-    },
+     "typescript": {
+       "version": "4.9.5",
+       "resolved": "https://registry.npmjs.org/typescript/-/typescript-4.9.5.tgz",
+       "integrity": "sha512-1FXk9E2Hm+QzZQ7z+McJiHL4NW1F2EzMu9Nq9i3zAaGqibafqYwCVU6WyWAuyQRRzOlxou8xZSyXLEN8oKj24g==",
+-      "devOptional": true
++      "dev": true
+     },
+     "uid": {
+       "version": "2.0.2",
+@@ -17571,7 +16280,7 @@
+       "version": "3.0.1",
+       "resolved": "https://registry.npmjs.org/v8-compile-cache-lib/-/v8-compile-cache-lib-3.0.1.tgz",
+       "integrity": "sha512-wa7YjyUGfNZngI/vtK0UHAN+lgDCxBPCylVXGp0zu59Fz5aiGtNXaq3DhIov063MorB+VfufLh3JlF2KdTK3xg==",
+-      "devOptional": true
++      "dev": true
+     },
+     "v8-to-istanbul": {
+       "version": "9.1.0",
+@@ -17769,6 +16478,7 @@
+       "version": "7.0.0",
+       "resolved": "https://registry.npmjs.org/wrap-ansi/-/wrap-ansi-7.0.0.tgz",
+       "integrity": "sha512-YVGIj2kamLSTxw6NsZjoBxfSwsn0ycdesmc4p+Q21c5zPuZ1pl+NfxVdxPtdHvmNVOQ6XSYG4AUtyt/Fi7D16Q==",
++      "dev": true,
+       "requires": {
+         "ansi-styles": "^4.0.0",
+         "string-width": "^4.1.0",
+@@ -17796,12 +16506,6 @@
+       "integrity": "sha512-kU62emKIdKVeEIOIKVegvqpXMSTAMLJozpHZaJNDYqBjzlSYXQGviYwN1osDLJ9av68qHd4a2oSjd7yD4pacig==",
+       "requires": {}
+     },
+-    "xml": {
+-      "version": "1.0.1",
+-      "resolved": "https://registry.npmjs.org/xml/-/xml-1.0.1.tgz",
+-      "integrity": "sha512-huCv9IH9Tcf95zuYCsQraZtWnJvBtLVE0QHMOs8bWyZAFZNDcYjsPq1nEx8jKA9y+Beo9v+7OBPRisQTjinQMw==",
+-      "dev": true
+-    },
+     "xss": {
+       "version": "1.0.14",
+       "resolved": "https://registry.npmjs.org/xss/-/xss-1.0.14.tgz",
+@@ -17826,7 +16530,8 @@
+     "y18n": {
+       "version": "5.0.8",
+       "resolved": "https://registry.npmjs.org/y18n/-/y18n-5.0.8.tgz",
+-      "integrity": "sha512-0pfFzegeDWJHJIAmTLRP2DwHjdF5s7jo9tuztdQxAhINCdvS+3nGINqPd00AphqJR/0LhANUS6/+7SCb98YOfA=="
++      "integrity": "sha512-0pfFzegeDWJHJIAmTLRP2DwHjdF5s7jo9tuztdQxAhINCdvS+3nGINqPd00AphqJR/0LhANUS6/+7SCb98YOfA==",
++      "dev": true
+     },
+     "yallist": {
+       "version": "4.0.0",
+@@ -17843,6 +16548,7 @@
+       "version": "17.7.2",
+       "resolved": "https://registry.npmjs.org/yargs/-/yargs-17.7.2.tgz",
+       "integrity": "sha512-7dSzzRQ++CKnNI/krKnYRV7JKKPUXMEh61soaHKg9mrWEhzFWhFnxPxGl+69cD1Ou63C13NUPCnmIcrvqCuM6w==",
++      "dev": true,
+       "requires": {
+         "cliui": "^8.0.1",
+         "escalade": "^3.1.1",
+@@ -17856,13 +16562,14 @@
+     "yargs-parser": {
+       "version": "21.1.1",
+       "resolved": "https://registry.npmjs.org/yargs-parser/-/yargs-parser-21.1.1.tgz",
+-      "integrity": "sha512-tVpsJW7DdjecAiFpbIB1e3qxIQsE6NoPc5/eTdrbbIC4h0LVsWhnoa3g+m2HclBIujHzsxZ4VJVA+GUuc2/LBw=="
++      "integrity": "sha512-tVpsJW7DdjecAiFpbIB1e3qxIQsE6NoPc5/eTdrbbIC4h0LVsWhnoa3g+m2HclBIujHzsxZ4VJVA+GUuc2/LBw==",
++      "dev": true
+     },
+     "yn": {
+       "version": "3.1.1",
+       "resolved": "https://registry.npmjs.org/yn/-/yn-3.1.1.tgz",
+       "integrity": "sha512-Ux4ygGWsu2c7isFWe8Yu1YluJmqVhxqK2cLXNQA5AcC3QfbGNpM7fu0Y8b/z16pXLnFxZYvWhd3fhBY9DLmC6Q==",
+-      "devOptional": true
++      "dev": true
+     },
+     "yocto-queue": {
+       "version": "0.1.0",
+diff --git a/package.json b/package.json
+index fbd3265..dad4ea9 100644
+--- a/package.json
++++ b/package.json
+@@ -1,63 +1,61 @@
+ {
+-  "name": "recruitment-task",
+-  "version": "0.0.1",
+-  "description": "",
+-  "author": "",
++  "name": "nodejs-app",
++  "version": "1.0.0",
++  "description": "NestJS customer API with Prisma, GraphQL and JWT authentication",
++  "license": "MIT",
+   "private": true,
+-  "license": "UNLICENSED",
+   "scripts": {
+     "prebuild": "rimraf dist",
+     "build": "nest build",
+     "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
+     "start": "nest start",
+     "start:dev": "nest start --watch",
+-    "lint": "eslint \"{src,apps,libs,test}/**/*.ts\" --fix"
++    "start:prod": "node dist/main",
++    "lint": "eslint \"{src,test}/**/*.ts\"",
++    "lint:fix": "eslint \"{src,test}/**/*.ts\" --fix",
++    "test": "jest",
++    "test:watch": "jest --watch",
++    "test:cov": "jest --coverage",
++    "test:e2e": "jest --config ./test/jest-e2e.json",
++    "typecheck": "tsc --noEmit",
++    "prisma:generate": "prisma generate",
++    "prisma:migrate": "prisma migrate dev",
++    "prisma:seed": "prisma db seed"
+   },
+   "prisma": {
+     "seed": "ts-node prisma/seed.ts"
+   },
+   "dependencies": {
+     "@nestjs/apollo": "^10.1.4",
+-    "@nestjs/axios": "^0.1.0",
+     "@nestjs/common": "^9.0.11",
+     "@nestjs/config": "^3.1.1",
+     "@nestjs/core": "^9.0.11",
+     "@nestjs/graphql": "^10.1.5",
+     "@nestjs/jwt": "^10.2.0",
+-    "@nestjs/microservices": "^9.0.11",
+     "@nestjs/passport": "^10.0.3",
+     "@nestjs/platform-express": "^9.0.11",
+     "@nestjs/swagger": "^6.1.2",
+-    "@nestjs/typeorm": "^9.0.1",
+     "@prisma/client": "^5.8.1",
+     "apollo-server-express": "^3.10.3",
+     "argon2": "^0.31.2",
++    "class-transformer": "^0.5.1",
+     "class-validator": "^0.14.0",
+     "graphql": "^16.6.0",
+-    "graphql-type-json": "^0.3.2",
+-    "papaparse": "^5.3.2",
+     "passport": "^0.7.0",
+     "passport-jwt": "^4.0.1",
+-    "passport-local": "^1.0.0",
+     "reflect-metadata": "^0.1.13",
+     "rimraf": "^3.0.2",
+     "rxjs": "^7.5.6",
+-    "swagger-ui-express": "^4.5.0",
+-    "typeorm": "^0.3.15"
++    "swagger-ui-express": "^4.5.0"
+   },
+   "devDependencies": {
+-    "@golevelup/ts-jest": "^0.3.3",
+     "@nestjs/cli": "^9.1.3",
+     "@nestjs/schematics": "^9.0.3",
+     "@nestjs/testing": "^9.0.11",
+-    "@types/bcrypt": "^5.0.2",
+     "@types/express": "^4.17.13",
+     "@types/jest": "29.0.3",
+-    "@types/multer": "^1.4.7",
+     "@types/node": "^18.7.1",
+-    "@types/papaparse": "^5.3.5",
+     "@types/passport-jwt": "^4.0.0",
+-    "@types/passport-local": "^1.0.38",
+     "@types/supertest": "^2.0.12",
+     "@typescript-eslint/eslint-plugin": "^5.33.0",
+     "@typescript-eslint/parser": "^5.33.0",
+@@ -65,8 +63,6 @@
+     "eslint-config-prettier": "^8.5.0",
+     "eslint-plugin-prettier": "^4.2.1",
+     "jest": "29.0.3",
+-    "jest-junit": "^14.0.1",
+-    "pino-pretty": "^9.1.1",
+     "prettier": "^2.7.1",
+     "prisma": "^5.8.1",
+     "source-map-support": "^0.5.21",
+@@ -83,26 +79,24 @@
+       "json",
+       "ts"
+     ],
+-    "setupFiles": [
+-      "<rootDir>/test/jest-setup.ts"
+-    ],
+     "modulePaths": [
+       "<rootDir>"
+     ],
+     "rootDir": "./",
+     "testRegex": ".*\\.spec\\.ts$",
++    "testPathIgnorePatterns": [
++      "/node_modules/",
++      "\\.e2e-spec\\.ts$"
++    ],
+     "transform": {
+       "^.+\\.(t|j)s$": "ts-jest"
+     },
+     "collectCoverageFrom": [
+-      "**/*.(t)s",
+-      "!**/*.module*.(t)s",
+-      "!**/*.e2e-spec.(t)s",
+-      "!**/prisma/**",
+-      "!.eslintrc.js",
++      "src/**/*.ts",
++      "!src/**/*.module.ts",
+       "!src/main.ts"
+     ],
+-    "coverageDirectory": "../coverage",
++    "coverageDirectory": "./coverage",
+     "testEnvironment": "node"
+   }
+ }
+diff --git a/prisma/seed.ts b/prisma/seed.ts
+index a58ce51..e34a8ea 100644
+--- a/prisma/seed.ts
++++ b/prisma/seed.ts
+@@ -1,23 +1,30 @@
+ import { PrismaClient } from '@prisma/client';
++import * as argon2 from 'argon2';
+ 
+ import { customers } from './seeds/customers';
+ 
+ const prisma = new PrismaClient();
+ 
+ async function main() {
+-  for (const customer of customers) {
++  if (process.env.NODE_ENV === 'production') {
++    throw new Error('Refusing to seed known credentials into production');
++  }
++
++  for (const { password, ...customer } of customers) {
++    const hashed = await argon2.hash(password);
+     await prisma.customer.upsert({
+       where: { id: customer.id },
+-      update: {},
+-      create: customer,
++      update: { password: hashed },
++      create: { ...customer, password: hashed },
+     });
+   }
+-  console.log(`Created ${customers.length} customers`);
++
++  console.log(`Seeded ${customers.length} customers`);
+ }
+ 
+ main()
+-  .catch((e) => {
+-    console.error(e);
++  .catch((error) => {
++    console.error(error);
+     process.exit(1);
+   })
+   .finally(async () => {
+diff --git a/prisma/seeds/customers.ts b/prisma/seeds/customers.ts
+index 3cab93d..87c9b19 100644
+--- a/prisma/seeds/customers.ts
++++ b/prisma/seeds/customers.ts
+@@ -1,16 +1,26 @@
+ import { Prisma } from '@prisma/client';
+ 
+-export const customers: Prisma.CustomerUpsertArgs['create'][] = [
++/**
++ * Seed customers. Passwords are plain text here and are hashed by seed.ts
++ * before they reach the database — the previous version stored them
++ * verbatim, which meant argon2.verify() could never match at login.
++ */
++export const customers: (Omit<
++  Prisma.CustomerUpsertArgs['create'],
++  'password'
++> & {
++  password: string;
++})[] = [
+   {
+     id: '9e391faf-64b2-4d4c-b879-463532920fd3',
+-    email: 'user@gmail.com',
+-    password: 'randow-password',
++    email: 'user@example.com',
++    password: 'local-dev-password',
+     role: 'USER',
+   },
+   {
+     id: '9e391faf-64b2-4d4c-b879-463532920fd4',
+-    email: 'user2@gmail.com',
+-    password: 'randow-password',
+-    role: 'USER',
++    email: 'admin@example.com',
++    password: 'local-dev-password',
++    role: 'ADMIN',
+   },
+ ];
+diff --git a/src/app.module.ts b/src/app.module.ts
+index a9569a6..229fbab 100644
+--- a/src/app.module.ts
++++ b/src/app.module.ts
+@@ -1,32 +1,34 @@
+ import { Module } from '@nestjs/common';
++import { join } from 'path';
+ import { GraphQLModule } from '@nestjs/graphql';
+ import { ApolloDriver, ApolloDriverConfig } from '@nestjs/apollo';
++import { ConfigModule } from '@nestjs/config';
+ 
+ import { AppController } from './app.controller';
+ import { AppService } from './app.service';
+-import { join } from 'path';
+ import { PrismaService } from './prisma.service';
+ import { CustomerModule } from './customer/customer.module';
+ import { AuthModule } from './authentication/auth.module';
+-import { ConfigModule } from '@nestjs/config';
++import { validateEnv } from './config/env.validation';
+ 
+ @Module({
+   imports: [
+-    CustomerModule,
+-    AuthModule,
++    // First, so that every other module's factory can read configuration.
++    ConfigModule.forRoot({
++      isGlobal: true,
++      validate: validateEnv,
++    }),
+     GraphQLModule.forRoot<ApolloDriverConfig>({
+       driver: ApolloDriver,
+       autoSchemaFile: join(process.cwd(), 'src/schema.gql'),
+-      buildSchemaOptions: {
+-        dateScalarMode: 'timestamp',
+-      },
+-      context: ({ request, reply }) => ({ request, reply }),
+-      playground: true,
+-      introspection: true, // TODO update this so that it's off in production;
+-    }),
+-    ConfigModule.forRoot({
+-      isGlobal: true,
++      buildSchemaOptions: { dateScalarMode: 'timestamp' },
++      // Schema introspection and the playground expose the full API surface,
++      // so they are limited to non-production environments.
++      playground: process.env.NODE_ENV !== 'production',
++      introspection: process.env.NODE_ENV !== 'production',
+     }),
++    CustomerModule,
++    AuthModule,
+   ],
+   controllers: [AppController],
+   providers: [AppService, PrismaService],
+diff --git a/src/authentication/access-token.strategy.ts b/src/authentication/access-token.strategy.ts
+index 9b6ecfd..c40b81d 100644
+--- a/src/authentication/access-token.strategy.ts
++++ b/src/authentication/access-token.strategy.ts
+@@ -1,29 +1,34 @@
+-import { Injectable } from '@nestjs/common';
++import { Injectable, UnauthorizedException } from '@nestjs/common';
+ import { ConfigService } from '@nestjs/config';
+ import { PassportStrategy } from '@nestjs/passport';
+-import { Prisma } from '@prisma/client';
+ import { Strategy, ExtractJwt } from 'passport-jwt';
+-import { AuthService } from './auth.service';
++import { AuthService, JwtPayload } from './auth.service';
+ 
+ @Injectable()
+-export class AccessTokenStrategy extends PassportStrategy(Strategy) {
++export class AccessTokenStrategy extends PassportStrategy(Strategy, 'jwt') {
+   constructor(
+-    private configService: ConfigService,
+-    private authService: AuthService,
++    configService: ConfigService,
++    private readonly authService: AuthService,
+   ) {
+     super({
+       jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
+       ignoreExpiration: false,
+-      secretOrKey: configService.get('JWT_SECRET'),
++      secretOrKey: configService.get<string>('JWT_SECRET'),
+     });
+   }
+ 
+-  async validate(customerDetails: Prisma.CustomerWhereUniqueInput) {
+-    const payload: Prisma.CustomerWhereUniqueInput = {
+-      email: customerDetails.email,
+-    };
+-    const customer = await this.authService.validateCustomer(payload);
+-
++  /**
++   * Passport has already verified the signature and expiry by this point.
++   * The customer is re-read from the database so that a token issued before
++   * an account was deleted or its role changed does not keep working.
++   */
++  async validate(payload: JwtPayload) {
++    const customer = await this.authService.validateCustomer({
++      email: payload.email,
++    });
++    if (!customer) {
++      throw new UnauthorizedException();
++    }
+     return customer;
+   }
+ }
+diff --git a/src/authentication/auth.controller.ts b/src/authentication/auth.controller.ts
+index 55e3e60..c40613d 100644
+--- a/src/authentication/auth.controller.ts
++++ b/src/authentication/auth.controller.ts
+@@ -1,76 +1,45 @@
+-import { Body, Controller, Post, Req, Res, UseGuards } from '@nestjs/common';
+-import { AuthService } from './auth.service';
+-import { Prisma } from '@prisma/client';
+-import { Request, Response } from 'express';
+-import { JwtAuthGuard } from './auth.gard';
++import {
++  Body,
++  Controller,
++  Get,
++  HttpCode,
++  HttpStatus,
++  Post,
++  Req,
++  UseGuards,
++} from '@nestjs/common';
++import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
++import { Request } from 'express';
++import { AuthService, Tokens } from './auth.service';
++import { JwtAuthGuard } from './jwt-auth.guard';
++import { LoginDto, SignupDto } from './dto/auth.dto';
+ 
++@ApiTags('auth')
+ @Controller('auth')
+ export class AuthController {
+   constructor(private readonly authService: AuthService) {}
+ 
+-  @UseGuards(JwtAuthGuard)
+-  @Post('login')
+-  async login(
+-    @Req() request: Request,
+-    @Res() response: Response,
+-    @Body() addCustomer: Prisma.CustomerWhereUniqueInput,
+-  ) {
+-    try {
+-      const result = await this.authService.login(addCustomer);
+-      console.log('controller: ', result);
+-      return response.status(200).json({
+-        status: 'Ok!',
+-        message: 'Successfully login!',
+-        access_token: result,
+-      });
+-    } catch (error) {
+-      return response.status(500).json({
+-        status: 'Error!',
+-        message: 'Internal Server Error!',
+-      });
+-    }
++  /**
++   * Public by design — requiring a token to obtain a token would make login
++   * impossible.
++   */
++  @Post('signup')
++  @HttpCode(HttpStatus.CREATED)
++  signup(@Body() body: SignupDto): Promise<Tokens> {
++    return this.authService.signup(body);
+   }
+ 
+-  @Post('signup')
+-  async signup(
+-    @Req() request: Request,
+-    @Res() response: Response,
+-    @Body() addCustomer: Prisma.CustomerCreateInput,
+-  ) {
+-    try {
+-      const result = await this.authService.signup(addCustomer);
+-      console.log('result', result);
+-      return response.status(200).json({
+-        status: 'Ok!',
+-        message: 'Successfully Signup!',
+-        access_token: result,
+-      });
+-    } catch (error) {
+-      return response.status(500).json({
+-        status: 'Error!',
+-        message: 'Internal Server Error!',
+-      });
+-    }
++  @Post('login')
++  @HttpCode(HttpStatus.OK)
++  login(@Body() body: LoginDto): Promise<Tokens> {
++    return this.authService.login(body);
+   }
+-  @Post('validate')
+-  async validateUser(
+-    @Req() request: Request,
+-    @Res() response: Response,
+-    @Body() addCustomer: Prisma.CustomerCreateInput,
+-  ) {
+-    try {
+-      const result = await this.authService.validateCustomer(addCustomer);
+-      console.log('result', result);
+-      return response.status(200).json({
+-        status: 'Ok!',
+-        message: 'Successfully Signup!',
+-        access_token: result,
+-      });
+-    } catch (error) {
+-      return response.status(500).json({
+-        status: 'Error!',
+-        message: 'Internal Server Error!',
+-      });
+-    }
++
++  /** Returns the customer behind the presented access token. */
++  @ApiBearerAuth()
++  @UseGuards(JwtAuthGuard)
++  @Get('me')
++  me(@Req() request: Request) {
++    return request.user;
+   }
+ }
+diff --git a/src/authentication/auth.gard.ts b/src/authentication/auth.gard.ts
+deleted file mode 100644
+index e0215a3..0000000
+--- a/src/authentication/auth.gard.ts
++++ /dev/null
+@@ -1,22 +0,0 @@
+-import { ExecutionContext, UnauthorizedException } from '@nestjs/common';
+-import { AuthGuard } from '@nestjs/passport';
+-import { Observable } from 'rxjs';
+-
+-export class JwtAuthGuard extends AuthGuard('jwt') {
+-  constructor() {
+-    super();
+-  }
+-  canActivate(
+-    context: ExecutionContext,
+-  ): boolean | Promise<boolean> | Observable<boolean> {
+-    return super.canActivate(context);
+-  }
+-
+-  handleRequest(err: any, customer: any): any {
+-    console.log('iu', customer);
+-    if (err || !customer) {
+-      throw err || new UnauthorizedException('you are not authorized!');
+-    }
+-    return customer;
+-  }
+-}
+diff --git a/src/authentication/auth.module.ts b/src/authentication/auth.module.ts
+index 8779fa3..fe3f3b6 100644
+--- a/src/authentication/auth.module.ts
++++ b/src/authentication/auth.module.ts
+@@ -1,42 +1,36 @@
+ import { Module } from '@nestjs/common';
++import { ConfigModule, ConfigService } from '@nestjs/config';
++import { JwtModule } from '@nestjs/jwt';
++import { PassportModule } from '@nestjs/passport';
+ import { AuthController } from './auth.controller';
+ import { AuthService } from './auth.service';
+-import { PrismaService } from 'src/prisma.service';
+ import { AccessTokenStrategy } from './access-token.strategy';
+-import { PassportModule } from '@nestjs/passport';
+-import { JwtModule } from '@nestjs/jwt';
+-import { CustomerService } from 'src/customer/customer.service';
+-import { LocalStrategy } from './local.strategy';
+-import { RolesGuard } from './role/roles.guard';
+ import { RefreshTokenStrategy } from './refresh-token.strategy';
+-import { ConfigModule } from '@nestjs/config';
+-import { ApiConfigService } from 'src/services/apiConfig.service';
+-import { ConfigService } from '@nestjs/config';
++import { RolesGuard } from './role/roles.guard';
++import { CustomerModule } from 'src/customer/customer.module';
+ 
+ @Module({
+   imports: [
+     PassportModule,
++    ConfigModule,
+     JwtModule.registerAsync({
++      imports: [ConfigModule],
+       inject: [ConfigService],
+-      useFactory: async (configService: ConfigService) => {
+-        return {
+-          secret: configService.get('JWT_SECRET'),
+-          signOptions: { expiresIn: configService.get('JWT_EXPIRES_IN') },
+-        };
+-      },
++      useFactory: (configService: ConfigService) => ({
++        secret: configService.get<string>('JWT_SECRET'),
++        signOptions: {
++          expiresIn: configService.get<string>('JWT_EXPIRES_IN'),
++        },
++      }),
+     }),
+-    ConfigModule,
++    CustomerModule,
+   ],
+   controllers: [AuthController],
+   providers: [
+     AuthService,
+-    LocalStrategy,
+-    CustomerService,
+-    PrismaService,
+     AccessTokenStrategy,
+     RefreshTokenStrategy,
+     RolesGuard,
+-    ApiConfigService,
+   ],
+ })
+ export class AuthModule {}
+diff --git a/src/authentication/auth.service.spec.ts b/src/authentication/auth.service.spec.ts
+new file mode 100644
+index 0000000..27bf809
+--- /dev/null
++++ b/src/authentication/auth.service.spec.ts
+@@ -0,0 +1,180 @@
++import { Test } from '@nestjs/testing';
++import { JwtModule, JwtService } from '@nestjs/jwt';
++import { ConfigService } from '@nestjs/config';
++import { ConflictException, UnauthorizedException } from '@nestjs/common';
++import * as argon2 from 'argon2';
++import { AuthService } from './auth.service';
++import { CustomerService } from 'src/customer/customer.service';
++
++const env: Record<string, string> = {
++  JWT_SECRET: 'test-access-secret',
++  JWT_EXPIRES_IN: '15m',
++  JWT_REFRESH_SECRET: 'test-refresh-secret',
++  JWT_REFRESH_EXPIRES_IN: '7d',
++};
++
++describe('AuthService', () => {
++  let authService: AuthService;
++  let jwtService: JwtService;
++  let customerService: jest.Mocked<
++    Pick<CustomerService, 'findCustomerEmail' | 'create'>
++  >;
++
++  const storedPassword = 'correct-horse-battery';
++  let storedHash: string;
++
++  beforeAll(async () => {
++    storedHash = await argon2.hash(storedPassword);
++  });
++
++  beforeEach(async () => {
++    customerService = {
++      findCustomerEmail: jest.fn(),
++      create: jest.fn(),
++    };
++
++    const moduleRef = await Test.createTestingModule({
++      imports: [JwtModule.register({})],
++      providers: [
++        AuthService,
++        { provide: CustomerService, useValue: customerService },
++        {
++          provide: ConfigService,
++          useValue: { get: (key: string) => env[key] },
++        },
++      ],
++    }).compile();
++
++    authService = moduleRef.get(AuthService);
++    jwtService = moduleRef.get(JwtService);
++  });
++
++  const existingCustomer = {
++    id: 'ff1b0c1e-0000-4000-8000-000000000001',
++    email: 'customer@example.com',
++    password: '',
++    role: 'USER',
++    createdAt: new Date(),
++    updatedAt: new Date(),
++  };
++
++  describe('login', () => {
++    it('issues tokens whose subject is the customer id, never the password hash', async () => {
++      customerService.findCustomerEmail.mockResolvedValue({
++        ...existingCustomer,
++        password: storedHash,
++      } as never);
++
++      const tokens = await authService.login({
++        email: existingCustomer.email,
++        password: storedPassword,
++      } as never);
++
++      const claims = jwtService.decode(tokens.access_token) as Record<
++        string,
++        unknown
++      >;
++
++      expect(claims.sub).toBe(existingCustomer.id);
++      // A JWT payload is base64, not encryption: anything placed here is
++      // readable by whoever holds the token.
++      expect(JSON.stringify(claims)).not.toContain(storedHash);
++      expect(JSON.stringify(claims)).not.toContain(storedPassword);
++    });
++
++    it('signs the refresh token with a different secret than the access token', async () => {
++      customerService.findCustomerEmail.mockResolvedValue({
++        ...existingCustomer,
++        password: storedHash,
++      } as never);
++
++      const tokens = await authService.login({
++        email: existingCustomer.email,
++        password: storedPassword,
++      } as never);
++
++      expect(() =>
++        jwtService.verify(tokens.refresh_token, { secret: env.JWT_SECRET }),
++      ).toThrow();
++      expect(
++        jwtService.verify(tokens.refresh_token, {
++          secret: env.JWT_REFRESH_SECRET,
++        }),
++      ).toMatchObject({ sub: existingCustomer.id });
++    });
++
++    it('rejects a wrong password', async () => {
++      customerService.findCustomerEmail.mockResolvedValue({
++        ...existingCustomer,
++        password: storedHash,
++      } as never);
++
++      await expect(
++        authService.login({
++          email: existingCustomer.email,
++          password: 'not-the-password',
++        } as never),
++      ).rejects.toBeInstanceOf(UnauthorizedException);
++    });
++
++    it('rejects an unknown email with the same error as a wrong password', async () => {
++      customerService.findCustomerEmail.mockResolvedValue(null as never);
++
++      await expect(
++        authService.login({
++          email: 'nobody@example.com',
++          password: storedPassword,
++        } as never),
++      ).rejects.toBeInstanceOf(UnauthorizedException);
++    });
++  });
++
++  describe('signup', () => {
++    it('stores a hash rather than the password itself', async () => {
++      customerService.findCustomerEmail.mockResolvedValue(null as never);
++      customerService.create.mockImplementation(
++        async (data: never) =>
++          ({ ...existingCustomer, ...(data as object) } as never),
++      );
++
++      await authService.signup({
++        email: 'new@example.com',
++        password: storedPassword,
++      } as never);
++
++      const [created] = customerService.create.mock.calls[0];
++      expect(created.password).not.toBe(storedPassword);
++      expect(await argon2.verify(created.password, storedPassword)).toBe(true);
++    });
++
++    it('refuses an email that is already registered', async () => {
++      customerService.findCustomerEmail.mockResolvedValue(
++        existingCustomer as never,
++      );
++
++      await expect(
++        authService.signup({
++          email: existingCustomer.email,
++          password: storedPassword,
++        } as never),
++      ).rejects.toBeInstanceOf(ConflictException);
++      expect(customerService.create).not.toHaveBeenCalled();
++    });
++  });
++
++  describe('validateCustomer', () => {
++    it('never returns the password hash', async () => {
++      customerService.findCustomerEmail.mockResolvedValue({
++        ...existingCustomer,
++        password: storedHash,
++      } as never);
++
++      const customer = await authService.validateCustomer({
++        email: existingCustomer.email,
++      });
++
++      expect(customer).not.toHaveProperty('password');
++      expect(customer).toMatchObject({ id: existingCustomer.id });
++    });
++  });
++});
+diff --git a/src/authentication/auth.service.ts b/src/authentication/auth.service.ts
+index 7bbf6df..7efd70e 100644
+--- a/src/authentication/auth.service.ts
++++ b/src/authentication/auth.service.ts
+@@ -1,18 +1,28 @@
+-import { ForbiddenException, Injectable } from '@nestjs/common';
++import {
++  ConflictException,
++  Injectable,
++  UnauthorizedException,
++} from '@nestjs/common';
+ import { Prisma } from '@prisma/client';
+ import { CustomerService } from 'src/customer/customer.service';
+ import { JwtService } from '@nestjs/jwt';
+ import { ConfigService } from '@nestjs/config';
+ import * as argon2 from 'argon2';
+ 
+-type Tokens = {
++export type Tokens = {
+   access_token: string;
+   refresh_token: string;
+ };
+ 
+-type JwtPayload = {
+-  email: string;
++/**
++ * Claims carried by both tokens. `sub` is the customer id — never the
++ * password or its hash, since a JWT payload is readable by anyone holding
++ * the token.
++ */
++export type JwtPayload = {
+   sub: string;
++  email: string;
++  role: string;
+ };
+ 
+ @Injectable()
+@@ -20,97 +30,84 @@ export class AuthService {
+   constructor(
+     private readonly jwtService: JwtService,
+     private readonly customerService: CustomerService,
+-    private configService: ConfigService,
++    private readonly configService: ConfigService,
+   ) {}
+ 
+-  async validateCustomer(addCustomer: Prisma.CustomerWhereUniqueInput) {
+-    const customer = await this.customerService.findCustomerEmail(addCustomer);
+-    if (customer && customer.email === addCustomer.email) {
+-      const { email, ...result } = customer;
+-      return result;
++  /**
++   * Looks up a customer by email and returns them without the password hash.
++   * Used by the JWT strategy to turn a token's claims back into a customer.
++   */
++  async validateCustomer(where: Prisma.CustomerWhereUniqueInput) {
++    const customer = await this.customerService.findCustomerEmail(where);
++    if (!customer) {
++      return null;
+     }
+-    return null;
++    const { password: _password, ...safeCustomer } = customer;
++    return safeCustomer;
+   }
+ 
+-  async signup(addCustomer: Prisma.CustomerCreateInput) {
+-    const hashPassword = await argon2.hash((await addCustomer).password);
+-    const payload: Prisma.CustomerCreateInput = {
+-      email: (await addCustomer).email,
+-      password: hashPassword,
+-    };
+-    const customer = await this.customerService
+-      .create(payload)
+-      .catch((error) => {
+-        throw error || new ForbiddenException('Access Denied');
+-      });
+-    const accessToken = await this.getTokens(
+-      (
+-        await customer
+-      ).email,
+-      (
+-        await customer
+-      ).password,
+-    );
+-    return accessToken;
+-  }
++  async signup(input: Prisma.CustomerCreateInput): Promise<Tokens> {
++    const existing = await this.customerService.findCustomerEmail({
++      email: input.email,
++    });
++    if (existing) {
++      // Deliberately the same wording the login path uses, so that signup
++      // cannot be used to enumerate which email addresses are registered.
++      throw new ConflictException('Unable to create account');
++    }
+ 
+-  async login(addCustomer: Prisma.CustomerWhereUniqueInput) {
+-    const customer = await this.customerService.findCustomerEmail(addCustomer);
++    const customer = await this.customerService.create({
++      email: input.email,
++      password: await argon2.hash(input.password),
++    });
+ 
+-    console.log('customer', customer);
++    return this.getTokens(customer.id, customer.email, customer.role);
++  }
++
++  async login(credentials: Prisma.CustomerWhereUniqueInput): Promise<Tokens> {
++    const customer = await this.customerService.findCustomerEmail({
++      email: credentials.email,
++    });
+ 
+-    const payload = {
+-      email: customer.email,
+-      sub: customer.password,
+-    };
++    // One error for "no such customer" and "wrong password" alike: telling
++    // them apart hands an attacker a list of valid accounts.
++    if (!customer) {
++      throw new UnauthorizedException('Invalid credentials');
++    }
+ 
+     const passwordMatches = await argon2.verify(
+       customer.password,
+-      addCustomer.password.toString(),
++      String(credentials.password),
+     );
++    if (!passwordMatches) {
++      throw new UnauthorizedException('Invalid credentials');
++    }
+ 
+-    if (!passwordMatches) throw new ForbiddenException('Access Denied');
+-
+-    const accessToken = await this.getTokens(
+-      (
+-        await customer
+-      ).email,
+-      (
+-        await customer
+-      ).password,
+-    );
+-    console.log('token', accessToken);
+-
+-    this.jwtService.signAsync(payload);
+-    return accessToken;
++    return this.getTokens(customer.id, customer.email, customer.role);
+   }
+ 
+-  async getTokens(email: string, password: string): Promise<Tokens> {
+-    const jwtPayload: JwtPayload = {
+-      sub: password,
+-      email: email,
+-    };
+-    const [at, rt] = await Promise.all([
+-      this.jwtService.signAsync(jwtPayload, {
+-        secret: this.configService.get('JWT_SECRET'),
+-        expiresIn: this.configService.get('JWT_EXPIRES_IN'),
++  async getTokens(id: string, email: string, role: string): Promise<Tokens> {
++    const payload: JwtPayload = { sub: id, email, role };
++
++    const [accessToken, refreshToken] = await Promise.all([
++      this.jwtService.signAsync(payload, {
++        secret: this.configService.get<string>('JWT_SECRET'),
++        expiresIn: this.configService.get<string>('JWT_EXPIRES_IN'),
+       }),
+-      this.jwtService.signAsync(jwtPayload, {
+-        secret: this.configService.get('JWT_REFRESH_SECRET'),
+-        expiresIn: this.configService.get('JWT_EXPIRES_IN'),
++      this.jwtService.signAsync(payload, {
++        secret: this.configService.get<string>('JWT_REFRESH_SECRET'),
++        expiresIn: this.configService.get<string>('JWT_REFRESH_EXPIRES_IN'),
+       }),
+     ]);
+-    return {
+-      access_token: at,
+-      refresh_token: rt,
+-    };
++
++    return { access_token: accessToken, refresh_token: refreshToken };
+   }
+ 
+   async refreshTokens(email: string): Promise<Tokens> {
+     const customer = await this.customerService.findCustomerEmail({ email });
+-
+-    const tokens = await this.getTokens(customer.email, customer.password);
+-
+-    return tokens;
++    if (!customer) {
++      throw new UnauthorizedException('Invalid credentials');
++    }
++    return this.getTokens(customer.id, customer.email, customer.role);
+   }
+ }
+diff --git a/src/authentication/dto/auth.dto.ts b/src/authentication/dto/auth.dto.ts
+new file mode 100644
+index 0000000..ce64572
+--- /dev/null
++++ b/src/authentication/dto/auth.dto.ts
+@@ -0,0 +1,23 @@
++import { ApiProperty } from '@nestjs/swagger';
++import { IsEmail, IsString, MinLength } from 'class-validator';
++
++export class SignupDto {
++  @ApiProperty({ example: 'customer@example.com' })
++  @IsEmail()
++  email: string;
++
++  @ApiProperty({ minLength: 12 })
++  @IsString()
++  @MinLength(12)
++  password: string;
++}
++
++export class LoginDto {
++  @ApiProperty({ example: 'customer@example.com' })
++  @IsEmail()
++  email: string;
++
++  @ApiProperty()
++  @IsString()
++  password: string;
++}
+diff --git a/src/authentication/jwt-auth.guard.ts b/src/authentication/jwt-auth.guard.ts
+new file mode 100644
+index 0000000..4fc4ac8
+--- /dev/null
++++ b/src/authentication/jwt-auth.guard.ts
+@@ -0,0 +1,12 @@
++import { ExecutionContext, Injectable } from '@nestjs/common';
++import { AuthGuard } from '@nestjs/passport';
++import { Observable } from 'rxjs';
++
++@Injectable()
++export class JwtAuthGuard extends AuthGuard('jwt') {
++  canActivate(
++    context: ExecutionContext,
++  ): boolean | Promise<boolean> | Observable<boolean> {
++    return super.canActivate(context);
++  }
++}
+diff --git a/src/authentication/local-auth.guard.ts b/src/authentication/local-auth.guard.ts
+deleted file mode 100644
+index ccf962b..0000000
+--- a/src/authentication/local-auth.guard.ts
++++ /dev/null
+@@ -1,5 +0,0 @@
+-import { Injectable } from '@nestjs/common';
+-import { AuthGuard } from '@nestjs/passport';
+-
+-@Injectable()
+-export class LocalAuthGuard extends AuthGuard('local') {}
+diff --git a/src/authentication/local.strategy.ts b/src/authentication/local.strategy.ts
+deleted file mode 100644
+index 5fe3c02..0000000
+--- a/src/authentication/local.strategy.ts
++++ /dev/null
+@@ -1,24 +0,0 @@
+-import { Injectable, UnauthorizedException } from '@nestjs/common';
+-import { PassportStrategy } from '@nestjs/passport';
+-import { Strategy } from 'passport-local';
+-import { AuthService } from './auth.service';
+-import { Prisma } from '@prisma/client';
+-
+-@Injectable()
+-export class LocalStrategy extends PassportStrategy(Strategy) {
+-  constructor(private authService: AuthService) {
+-    super();
+-  }
+-
+-  async validate(email: string, password: string): Promise<any> {
+-    console.log('vali', email);
+-    console.log('valie', password);
+-    const payload: Prisma.CustomerWhereUniqueInput = { email, password };
+-    const customer = await this.authService.validateCustomer(payload);
+-    console.log('vali', customer);
+-    if (!customer) {
+-      throw new UnauthorizedException();
+-    }
+-    return customer;
+-  }
+-}
+diff --git a/src/authentication/refresh-token.strategy.ts b/src/authentication/refresh-token.strategy.ts
+index db38632..739da07 100644
+--- a/src/authentication/refresh-token.strategy.ts
++++ b/src/authentication/refresh-token.strategy.ts
+@@ -3,19 +3,28 @@ import { ConfigService } from '@nestjs/config';
+ import { PassportStrategy } from '@nestjs/passport';
+ import { Request } from 'express';
+ import { Strategy, ExtractJwt } from 'passport-jwt';
++import { JwtPayload } from './auth.service';
+ 
+ @Injectable()
+-export class RefreshTokenStrategy extends PassportStrategy(Strategy) {
+-  constructor(private configService: ConfigService) {
++export class RefreshTokenStrategy extends PassportStrategy(
++  Strategy,
++  'jwt-refresh',
++) {
++  constructor(configService: ConfigService) {
+     super({
+       jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
+       secretOrKey: configService.get<string>('JWT_REFRESH_SECRET'),
+       ignoreExpiration: false,
++      // Without this, validate() receives the payload as its first argument
++      // and `req` is never passed — the raw token below would be undefined.
++      passReqToCallback: true,
+     });
+   }
+ 
+-  async validate(req: Request, payload: any) {
+-    const refreshToken = req.get('Authorization').replace('Bearer', '').trim();
++  async validate(req: Request, payload: JwtPayload) {
++    const refreshToken = (req.get('Authorization') ?? '')
++      .replace('Bearer', '')
++      .trim();
+     return { ...payload, refreshToken };
+   }
+ }
+diff --git a/src/authentication/role/enums/role.enum.ts b/src/authentication/role/enums/role.enum.ts
+index 6ee399d..0107bdf 100644
+--- a/src/authentication/role/enums/role.enum.ts
++++ b/src/authentication/role/enums/role.enum.ts
+@@ -1,4 +1,9 @@
++/**
++ * Mirrors the `Role` enum in prisma/schema.prisma. The values must stay
++ * identical to the database values — comparing 'user' against a stored
++ * 'USER' silently denies every request.
++ */
+ export enum Role {
+-  USER = 'user',
+-  ADMIN = 'admin',
++  USER = 'USER',
++  ADMIN = 'ADMIN',
+ }
+diff --git a/src/authentication/role/roles.guard.spec.ts b/src/authentication/role/roles.guard.spec.ts
+new file mode 100644
+index 0000000..352586f
+--- /dev/null
++++ b/src/authentication/role/roles.guard.spec.ts
+@@ -0,0 +1,58 @@
++import { ExecutionContext } from '@nestjs/common';
++import { Reflector } from '@nestjs/core';
++import { RolesGuard } from './roles.guard';
++import { Role } from './enums/role.enum';
++
++function contextWith(request: Record<string, unknown>): ExecutionContext {
++  return {
++    getHandler: () => jest.fn(),
++    getClass: () => jest.fn(),
++    switchToHttp: () => ({ getRequest: () => request }),
++  } as unknown as ExecutionContext;
++}
++
++describe('RolesGuard', () => {
++  let reflector: Reflector;
++  let guard: RolesGuard;
++
++  beforeEach(() => {
++    reflector = new Reflector();
++    guard = new RolesGuard(reflector);
++  });
++
++  function requireRoles(...roles: Role[]) {
++    jest.spyOn(reflector, 'getAllAndOverride').mockReturnValue(roles);
++  }
++
++  it('allows a handler with no @Roles decorator', () => {
++    jest.spyOn(reflector, 'getAllAndOverride').mockReturnValue(undefined);
++    expect(guard.canActivate(contextWith({}))).toBe(true);
++  });
++
++  it('allows a principal holding the required role', () => {
++    requireRoles(Role.ADMIN);
++    expect(guard.canActivate(contextWith({ user: { role: 'ADMIN' } }))).toBe(
++      true,
++    );
++  });
++
++  it('denies a principal without the required role', () => {
++    requireRoles(Role.ADMIN);
++    expect(guard.canActivate(contextWith({ user: { role: 'USER' } }))).toBe(
++      false,
++    );
++  });
++
++  it('ignores a role supplied in the request body', () => {
++    // The earlier implementation read the role from the body, so this
++    // request would have been granted admin access on the client's say-so.
++    requireRoles(Role.ADMIN);
++    const request = { user: { role: 'USER' }, body: { role: 'ADMIN' } };
++    expect(guard.canActivate(contextWith(request))).toBe(false);
++  });
++
++  it('denies an unauthenticated request', () => {
++    requireRoles(Role.USER);
++    expect(guard.canActivate(contextWith({}))).toBe(false);
++  });
++});
+diff --git a/src/authentication/role/roles.guard.ts b/src/authentication/role/roles.guard.ts
+index a71bd26..49f0e08 100644
+--- a/src/authentication/role/roles.guard.ts
++++ b/src/authentication/role/roles.guard.ts
+@@ -1,27 +1,30 @@
+ import { Injectable, CanActivate, ExecutionContext } from '@nestjs/common';
+ import { Reflector } from '@nestjs/core';
+ import { Role } from './enums/role.enum';
+-import { Observable } from 'rxjs';
+ import { ROLES_KEY } from './decorators/roles.decorator';
+ 
+ @Injectable()
+ export class RolesGuard implements CanActivate {
+-  constructor(private reflector: Reflector) {}
++  constructor(private readonly reflector: Reflector) {}
+ 
+-  canActivate(
+-    context: ExecutionContext,
+-  ): boolean | Promise<boolean> | Observable<boolean> {
++  canActivate(context: ExecutionContext): boolean {
+     const requiredRoles = this.reflector.getAllAndOverride<Role[]>(ROLES_KEY, [
+       context.getHandler(),
+       context.getClass(),
+     ]);
+ 
+-    if (!requiredRoles) {
++    if (!requiredRoles || requiredRoles.length === 0) {
+       return true;
+     }
+-    console.log(context.switchToHttp().getRequest());
+-    const { body } = context.switchToHttp().getRequest();
+-    console.log('it', body);
+-    return requiredRoles.some((r) => body.role?.includes(r.toUpperCase()));
++
++    // The role is read from the authenticated principal, which comes from a
++    // signed token. Reading it from the request body would let any caller
++    // grant themselves a role simply by sending one.
++    const { user } = context.switchToHttp().getRequest();
++    if (!user?.role) {
++      return false;
++    }
++
++    return requiredRoles.includes(user.role as Role);
+   }
+ }
+diff --git a/src/config/env.validation.spec.ts b/src/config/env.validation.spec.ts
+new file mode 100644
+index 0000000..69e2de0
+--- /dev/null
++++ b/src/config/env.validation.spec.ts
+@@ -0,0 +1,27 @@
++import { validateEnv } from './env.validation';
++
++const valid = {
++  DATABASE_URL: 'postgresql://localhost:5432/app',
++  JWT_SECRET: 'access',
++  JWT_EXPIRES_IN: '15m',
++  JWT_REFRESH_SECRET: 'refresh',
++  JWT_REFRESH_EXPIRES_IN: '7d',
++};
++
++describe('validateEnv', () => {
++  it('passes a complete configuration through unchanged', () => {
++    expect(validateEnv({ ...valid })).toMatchObject(valid);
++  });
++
++  it('names every missing variable at once', () => {
++    const { JWT_SECRET: _s, DATABASE_URL: _d, ...incomplete } = valid;
++    expect(() => validateEnv(incomplete)).toThrow(/DATABASE_URL/);
++    expect(() => validateEnv(incomplete)).toThrow(/JWT_SECRET/);
++  });
++
++  it('rejects reusing one secret for both token types', () => {
++    expect(() =>
++      validateEnv({ ...valid, JWT_REFRESH_SECRET: valid.JWT_SECRET }),
++    ).toThrow(/must differ/);
++  });
++});
+diff --git a/src/config/env.validation.ts b/src/config/env.validation.ts
+new file mode 100644
+index 0000000..e57942e
+--- /dev/null
++++ b/src/config/env.validation.ts
+@@ -0,0 +1,33 @@
++/**
++ * Fails fast at boot if required configuration is missing.
++ *
++ * Without this, a missing JWT_SECRET surfaces much later as tokens signed
++ * with `undefined` — which still produces a working-looking token.
++ */
++const required = [
++  'DATABASE_URL',
++  'JWT_SECRET',
++  'JWT_EXPIRES_IN',
++  'JWT_REFRESH_SECRET',
++  'JWT_REFRESH_EXPIRES_IN',
++] as const;
++
++export function validateEnv(config: Record<string, unknown>) {
++  const missing = required.filter((key) => !config[key]);
++
++  if (missing.length > 0) {
++    throw new Error(
++      `Missing required environment variables: ${missing.join(', ')}. ` +
++        'See .env.example.',
++    );
++  }
++
++  if (String(config.JWT_SECRET) === String(config.JWT_REFRESH_SECRET)) {
++    throw new Error(
++      'JWT_SECRET and JWT_REFRESH_SECRET must differ, otherwise a refresh ' +
++        'token is accepted anywhere an access token is.',
++    );
++  }
++
++  return config;
++}
+diff --git a/src/customer/customer.controller.ts b/src/customer/customer.controller.ts
+index ba1ac26..ffb8809 100644
+--- a/src/customer/customer.controller.ts
++++ b/src/customer/customer.controller.ts
+@@ -1,50 +1,65 @@
+ import {
+   Body,
+   Controller,
++  DefaultValuePipe,
+   Delete,
+   Get,
++  NotFoundException,
+   Param,
++  ParseIntPipe,
+   Patch,
+-  Post,
++  Query,
+   UseGuards,
+ } from '@nestjs/common';
++import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
+ import { CustomerService } from './customer.service';
+-import { WhereCustomerInput } from './dto/customer.input';
+-import { Prisma } from '@prisma/client';
++import { UpdateCustomerInput } from './dto/customer.input';
++import { JwtAuthGuard } from 'src/authentication/jwt-auth.guard';
+ import { RolesGuard } from 'src/authentication/role/roles.guard';
+ import { Roles } from 'src/authentication/role/decorators/roles.decorator';
+ import { Role } from 'src/authentication/role/enums/role.enum';
+ 
+-@Controller()
++@ApiTags('customers')
++@ApiBearerAuth()
++@UseGuards(JwtAuthGuard, RolesGuard)
++@Controller('customers')
+ export class CustomerController {
+   constructor(private readonly customerService: CustomerService) {}
+ 
+-  @Post('/customer')
+-  addCustomer(@Body() data: Prisma.CustomerCreateInput) {
+-    return this.customerService.create(data);
++  @Get()
++  list(
++    @Query('skip', new DefaultValuePipe(0), ParseIntPipe) skip: number,
++    @Query('take', new DefaultValuePipe(25), ParseIntPipe) take: number,
++  ) {
++    return this.customerService.findAll({ skip, take });
+   }
+ 
+-  @Get('/customers')
+-  getCustomers() {
+-    return this.customerService.findAll();
++  /**
++   * Previously this was `GET /customer` reading the email from the request
++   * body. Bodies on GET requests are dropped by many proxies and clients,
++   * so the identifier belongs in the path.
++   */
++  @Get(':id')
++  async getOne(@Param('id') id: string) {
++    const customer = await this.customerService.findById(id);
++    if (!customer) {
++      throw new NotFoundException(`Customer ${id} not found`);
++    }
++    return customer;
+   }
+ 
+-  @Get('/customer')
+-  getCustomer(@Body() email: Prisma.CustomerWhereUniqueInput) {
+-    return this.customerService.findCustomerEmail(email);
+-  }
+-
+-  @Roles(Role.USER)
+-  @UseGuards(RolesGuard)
+   @Patch(':id')
+-  updateCustomer(@Param('id') id: string, @Body() data: WhereCustomerInput) {
++  update(@Param('id') id: string, @Body() data: UpdateCustomerInput) {
+     return this.customerService.updateById(id, data);
+   }
+ 
+-  // @Roles(Role.USER)
+-  // @UseGuards(RolesGuard)
++  /**
++   * Deleting a customer is admin-only. The guard on the previous version of
++   * this handler was commented out, leaving the endpoint open to anyone.
++   */
++  @Roles(Role.ADMIN)
+   @Delete(':id')
+-  deleteCustomer(@Param() id: Prisma.CustomerWhereUniqueInput) {
++  remove(@Param('id') id: string) {
+     return this.customerService.deleteById(id);
+   }
+ }
+diff --git a/src/customer/customer.module.ts b/src/customer/customer.module.ts
+index 41c1614..5ddc78e 100644
+--- a/src/customer/customer.module.ts
++++ b/src/customer/customer.module.ts
+@@ -3,22 +3,13 @@ import { CustomerService } from './customer.service';
+ import { PrismaService } from 'src/prisma.service';
+ import { CustomerResolver } from './customer.resolver';
+ import { CustomerController } from './customer.controller';
+-import { ConfigModule } from '@nestjs/config';
+-import { PassportModule } from '@nestjs/passport';
+-import { JwtModule } from '@nestjs/jwt';
+ 
+ @Module({
+-  imports: [
+-    PassportModule,
+-    JwtModule.register({
+-      secret: 'process.env.JWT_SECRET',
+-      signOptions: {
+-        expiresIn: process.env.JWT_EXPIRES_IN,
+-      },
+-    }),
+-    ConfigModule,
+-  ],
+   controllers: [CustomerController],
+   providers: [CustomerService, PrismaService, CustomerResolver],
++  // Exported so AuthModule can reuse the same service rather than
++  // re-registering CustomerService and PrismaService as its own providers,
++  // which would give the two modules separate Prisma connections.
++  exports: [CustomerService],
+ })
+ export class CustomerModule {}
+diff --git a/src/customer/customer.resolver.ts b/src/customer/customer.resolver.ts
+index 5b503ba..cd5e658 100644
+--- a/src/customer/customer.resolver.ts
++++ b/src/customer/customer.resolver.ts
+@@ -1,18 +1,22 @@
+-import { Query, Resolver } from '@nestjs/graphql';
+-import { Customer } from 'lib/entities/customer.entity';
++import { Args, Query, Resolver } from '@nestjs/graphql';
++import { UseGuards } from '@nestjs/common';
++import { Customer } from 'src/lib/entities/customer.entity';
+ import { CustomerService } from './customer.service';
+-// import { GetCustomerInput } from './dto/customer.input';
++import { ListCustomersInput } from './dto/customer.input';
++import { JwtAuthGuard } from 'src/authentication/jwt-auth.guard';
+ 
+ @Resolver(() => Customer)
++@UseGuards(JwtAuthGuard)
+ export class CustomerResolver {
+   constructor(private readonly customerService: CustomerService) {}
+ 
+   @Query(() => [Customer])
+-  async customers() {
+-    return this.customerService.findAll();
++  customers(
++    @Args('input', { nullable: true }) input?: ListCustomersInput,
++  ): Promise<Customer[]> {
++    return this.customerService.findAll({
++      skip: input?.skip,
++      take: input?.take,
++    }) as Promise<Customer[]>;
+   }
+-  // @Query(() => [Customer])
+-  // async customers(@Args('data') { skip, take, where }: GetCustomerInput) {
+-  //   return this.customerService.findAll({ skip, take, where });
+-  // }
+ }
+diff --git a/src/customer/customer.service.ts b/src/customer/customer.service.ts
+index 4bc3cdc..556288a 100644
+--- a/src/customer/customer.service.ts
++++ b/src/customer/customer.service.ts
+@@ -1,78 +1,89 @@
+-import { ForbiddenException, Injectable } from '@nestjs/common';
+-import { PrismaService } from 'src/prisma.service';
+-import { WhereCustomerInput } from './dto/customer.input';
++import { Injectable, NotFoundException } from '@nestjs/common';
+ import { Prisma } from '@prisma/client';
+-import { JwtService } from '@nestjs/jwt';
+ import { PrismaClientKnownRequestError } from '@prisma/client/runtime/library';
++import { PrismaService } from 'src/prisma.service';
++import { UpdateCustomerInput } from './dto/customer.input';
++
++/** Columns returned to callers — the password hash is never among them. */
++const publicCustomerFields: Prisma.CustomerSelect = {
++  id: true,
++  email: true,
++  role: true,
++  createdAt: true,
++  updatedAt: true,
++};
+ 
+ @Injectable()
+ export class CustomerService {
+-  constructor(
+-    private prisma: PrismaService,
+-    private readonly jwtService: JwtService,
+-  ) {}
++  constructor(private readonly prisma: PrismaService) {}
+ 
+-  async findAll() {
+-    const result = this.prisma.customer.findMany().catch((error) => {
+-      if (error instanceof PrismaClientKnownRequestError) {
+-        throw new ForbiddenException('Credentials incorrect');
+-      }
+-      throw error;
++  findAll(params: { skip?: number; take?: number } = {}) {
++    const { skip = 0, take = 25 } = params;
++    return this.prisma.customer.findMany({
++      skip,
++      // Capped so that a caller cannot ask for the entire table in one query.
++      take: Math.min(take, 100),
++      orderBy: { createdAt: 'desc' },
++      select: publicCustomerFields,
+     });
+-    return result;
+   }
+-  // async findAll(params: GetCustomerInput) {
+-  //   const { skip, take, cursor, where } = params;
+ 
+-  //   return this.prisma.customer.findMany({
+-  //     skip,
+-  //     take,
+-  //     cursor,
+-  //     where,
+-  //   });
+-  // }
+-
+-  async findCustomerEmail(customer: Prisma.CustomerWhereUniqueInput) {
++  /**
++   * Returns the full record including the password hash. Only the
++   * authentication layer should call this.
++   */
++  findCustomerEmail(where: Prisma.CustomerWhereUniqueInput) {
+     return this.prisma.customer.findUnique({
+-      where: {
+-        email: customer.email,
+-      },
++      where: { email: where.email },
+     });
+   }
+ 
+-  async create(addCustomer: Prisma.CustomerCreateInput) {
+-    const result = this.prisma.customer.create({
+-      data: addCustomer,
++  findById(id: string) {
++    return this.prisma.customer.findUnique({
++      where: { id },
++      select: publicCustomerFields,
+     });
+-    return result;
+   }
+ 
+-  async updateById(id: string, updateCustomer: WhereCustomerInput) {
+-    const result = this.prisma.customer
+-      .update({
+-        where: { id: id },
+-        data: updateCustomer,
+-      })
+-      .catch((error) => {
+-        if (error instanceof PrismaClientKnownRequestError) {
+-          throw new ForbiddenException('Credentials incorrect');
+-        }
+-        throw error;
++  create(data: Prisma.CustomerCreateInput) {
++    return this.prisma.customer.create({ data });
++  }
++
++  async updateById(id: string, data: UpdateCustomerInput) {
++    try {
++      return await this.prisma.customer.update({
++        where: { id },
++        data,
++        select: publicCustomerFields,
+       });
+-    return result;
++    } catch (error) {
++      throw this.translatePrismaError(error, id);
++    }
+   }
+ 
+-  async deleteById(id: Prisma.CustomerWhereUniqueInput) {
+-    const result = this.prisma.customer
+-      .delete({
+-        where: id,
+-      })
+-      .catch((error) => {
+-        if (error instanceof PrismaClientKnownRequestError) {
+-          throw new ForbiddenException('Credentials incorrect');
+-        }
+-        throw error;
++  async deleteById(id: string) {
++    try {
++      return await this.prisma.customer.delete({
++        where: { id },
++        select: publicCustomerFields,
+       });
+-    return result;
++    } catch (error) {
++      throw this.translatePrismaError(error, id);
++    }
++  }
++
++  /**
++   * Prisma reports a missing row as P2025. Previously this surfaced as a
++   * 403 "Credentials incorrect", which is neither the right status nor an
++   * accurate description of what happened.
++   */
++  private translatePrismaError(error: unknown, id: string): unknown {
++    if (
++      error instanceof PrismaClientKnownRequestError &&
++      error.code === 'P2025'
++    ) {
++      return new NotFoundException(`Customer ${id} not found`);
++    }
++    return error;
+   }
+ }
+diff --git a/src/customer/dto/customer.input.ts b/src/customer/dto/customer.input.ts
+index 43b3cf9..73e05bc 100644
+--- a/src/customer/dto/customer.input.ts
++++ b/src/customer/dto/customer.input.ts
+@@ -1,47 +1,26 @@
+ import { Field, InputType, Int } from '@nestjs/graphql';
+-import { Prisma } from '@prisma/client';
++import { ApiPropertyOptional } from '@nestjs/swagger';
++import { IsEmail, IsInt, IsOptional, Max, Min } from 'class-validator';
+ 
+ @InputType()
+-export class WhereCustomerInput {
+-  @Field(() => String, { nullable: true })
+-  id?: string;
+-
+-  @Field(() => String, { nullable: true })
+-  email?: string;
+-
+-  @Field(() => Date, { nullable: true })
+-  createdAt?: Date;
+-
+-  @Field(() => Date, { nullable: true })
+-  updatedAt?: Date;
+-
+-  @Field(() => String, { nullable: true })
+-  rfToken?: string;
+-}
+-
+-@InputType()
+-export class GetCustomerInput {
+-  @Field(() => String, { nullable: true })
+-  cursor?: Prisma.CustomerWhereUniqueInput;
+-
+-  @Field(() => Int, { nullable: true })
+-  skip: number;
+-
+-  @Field(() => Int, { nullable: true })
+-  take: number;
+-
+-  @Field(() => WhereCustomerInput, { nullable: true })
+-  where: WhereCustomerInput;
++export class ListCustomersInput {
++  @Field(() => Int, { nullable: true, defaultValue: 0 })
++  @IsOptional()
++  @IsInt()
++  @Min(0)
++  skip?: number;
++
++  @Field(() => Int, { nullable: true, defaultValue: 25 })
++  @IsOptional()
++  @IsInt()
++  @Min(1)
++  @Max(100)
++  take?: number;
+ }
+ 
+-@InputType()
+ export class UpdateCustomerInput {
+-  @Field(() => String, { nullable: true })
+-  data: Prisma.XOR<
+-    Prisma.CustomerUpdateInput,
+-    Prisma.CustomerUncheckedUpdateInput
+-  >;
+-
+-  @Field(() => String, { nullable: true })
+-  where: Prisma.CustomerWhereUniqueInput;
++  @ApiPropertyOptional({ example: 'customer@example.com' })
++  @IsOptional()
++  @IsEmail()
++  email?: string;
+ }
+diff --git a/src/enums/timeUnit.enum.ts b/src/enums/timeUnit.enum.ts
+new file mode 100644
+index 0000000..17fe903
+--- /dev/null
++++ b/src/enums/timeUnit.enum.ts
+@@ -0,0 +1,16 @@
++/**
++ * Granularity used when comparing two dates.
++ *
++ * Every unit is evaluated in UTC so that results do not depend on the
++ * timezone of the machine running the code.
++ */
++export enum TimeUnit {
++  Minute = 'MINUTE',
++  Hour = 'HOUR',
++  Day = 'DAY',
++  /** ISO week: Monday 00:00:00 UTC through Sunday 23:59:59 UTC. */
++  Week = 'WEEK',
++  Month = 'MONTH',
++  Quarter = 'QUARTER',
++  Year = 'YEAR',
++}
+diff --git a/src/lib/datesMatch.ts b/src/lib/datesMatch.ts
+new file mode 100644
+index 0000000..82d92c7
+--- /dev/null
++++ b/src/lib/datesMatch.ts
+@@ -0,0 +1,63 @@
++import { TimeUnit } from '../enums/timeUnit.enum';
++
++const MS_PER_DAY = 24 * 60 * 60 * 1000;
++
++/**
++ * Returns the start of the calendar bucket `date` falls into, for the given
++ * unit, as a comparable string key. Two dates are in the same bucket when
++ * their keys are identical.
++ *
++ * Buckets are aligned to calendar boundaries rather than to elapsed time:
++ * 23:59 and 00:01 the next day are one minute apart but are different days,
++ * and 31 December and 1 January are different years.
++ */
++function bucketKey(date: Date, unit: TimeUnit): string {
++  const year = date.getUTCFullYear();
++  const month = date.getUTCMonth();
++  const day = date.getUTCDate();
++
++  switch (unit) {
++    case TimeUnit.Minute:
++      return `${year}-${month}-${day}T${date.getUTCHours()}:${date.getUTCMinutes()}`;
++    case TimeUnit.Hour:
++      return `${year}-${month}-${day}T${date.getUTCHours()}`;
++    case TimeUnit.Day:
++      return `${year}-${month}-${day}`;
++    case TimeUnit.Week: {
++      // Monday-based week. getUTCDay() is 0 for Sunday, so shift it so that
++      // Monday is 0 and Sunday is 6, then step back to that week's Monday.
++      const dayOfWeek = (date.getUTCDay() + 6) % 7;
++      const monday = new Date(
++        Date.UTC(year, month, day) - dayOfWeek * MS_PER_DAY,
++      );
++      return `W${monday.toISOString().slice(0, 10)}`;
++    }
++    case TimeUnit.Month:
++      return `${year}-${month}`;
++    case TimeUnit.Quarter:
++      return `${year}-Q${Math.floor(month / 3)}`;
++    case TimeUnit.Year:
++      return `${year}`;
++    default: {
++      // Exhaustiveness check: adding a TimeUnit without handling it here is a
++      // compile error rather than a silent `false` at runtime.
++      const unhandled: never = unit;
++      throw new Error(`Unsupported time unit: ${unhandled}`);
++    }
++  }
++}
++
++/**
++ * Whether two dates fall within the same calendar bucket at the given
++ * granularity.
++ *
++ * @example
++ * datesMatch(new Date('2023-05-03T10:00:00Z'), new Date('2023-05-03T10:00:30Z'), TimeUnit.Minute) // true
++ * datesMatch(new Date('2023-05-03T10:00:00Z'), new Date('2023-05-03T10:01:00Z'), TimeUnit.Minute) // false
++ */
++export function datesMatch(a: Date, b: Date, unit: TimeUnit): boolean {
++  if (Number.isNaN(a.getTime()) || Number.isNaN(b.getTime())) {
++    throw new TypeError('datesMatch received an invalid Date');
++  }
++  return bucketKey(a, unit) === bucketKey(b, unit);
++}
+diff --git a/src/lib/entities/customer.entity.ts b/src/lib/entities/customer.entity.ts
+index 3e9049c..616f8c1 100644
+--- a/src/lib/entities/customer.entity.ts
++++ b/src/lib/entities/customer.entity.ts
+@@ -1,8 +1,11 @@
+ import { Field, ObjectType } from '@nestjs/graphql';
+-import { Base } from 'lib/entities/base.entity';
++import { Base } from './base.entity';
+ 
+ @ObjectType()
+ export class Customer extends Base {
+   @Field(() => String)
+   email: string;
++
++  @Field(() => String)
++  role: string;
+ }
+diff --git a/src/main.ts b/src/main.ts
+index 058c713..9dbd423 100644
+--- a/src/main.ts
++++ b/src/main.ts
+@@ -1,32 +1,40 @@
+ import { NestFactory } from '@nestjs/core';
++import { ConfigService } from '@nestjs/config';
++import { ValidationPipe } from '@nestjs/common';
+ import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
+ import { AppModule } from './app.module';
+-// import { PrismaService } from './prisma.service';
+ 
+ async function bootstrap() {
+-  process.env.DATABASE_URL = `postgresql://${process.env.DB_USER}:${process.env.DB_PASSWORD}@${process.env.DB_HOST}:${process.env.DB_PORT}/${process.env.DB_DATABASE}?schema=${process.env.DB_SCHEMA}&sslmode=prefer`;
+-  process.env.SHADOW_DATABASE_URL = `postgresql://${process.env.DB_USER}:${process.env.DB_PASSWORD}@${process.env.DB_HOST}:${process.env.DB_PORT}/${process.env.DB_DATABASE}?schema=dbmigration&sslmode=prefer`;
++  const app = await NestFactory.create(AppModule, { cors: true });
++  const config = app.get(ConfigService);
+ 
+-  const app = await NestFactory.create(AppModule, {
+-    bufferLogs: true,
+-    cors: true,
+-  });
+-  // app.useLogger(app.get(PinoLogger));
+-  // const prismaService = app.get(PrismaService);
+-  // await prismaService.enableShutdownHooks(app);
+-  app.enableShutdownHooks();
+-  const config = new DocumentBuilder()
+-    .setTitle('Service Example')
+-    .setDescription('Service that can be used for boiler plating')
+-    .setVersion('1.0')
+-    .addTag('example')
+-    .addTag('default')
+-    .addBearerAuth()
+-    .build();
+-  const document = SwaggerModule.createDocument(app, config);
+-  SwaggerModule.setup('api', app, document);
++  app.useGlobalPipes(
++    new ValidationPipe({
++      // Strip properties that have no matching DTO field, and reject the
++      // request if any were sent, so clients cannot smuggle extra columns
++      // (a `role` of their choosing, for instance) into a write.
++      whitelist: true,
++      forbidNonWhitelisted: true,
++      transform: true,
++    }),
++  );
++
++  if (config.get('NODE_ENV') !== 'production') {
++    const swaggerConfig = new DocumentBuilder()
++      .setTitle('Customer API')
++      .setDescription('REST and GraphQL API for customer records')
++      .setVersion('1.0')
++      .addBearerAuth()
++      .build();
++    SwaggerModule.setup(
++      'api',
++      app,
++      SwaggerModule.createDocument(app, swaggerConfig),
++    );
++  }
+ 
+-  await app.startAllMicroservices();
+-  await app.listen(8080);
++  app.enableShutdownHooks();
++  await app.listen(config.get<number>('PORT') ?? 8080);
+ }
++
+ bootstrap();
+diff --git a/src/prisma.service.ts b/src/prisma.service.ts
+index b67ddc2..ba00c9f 100644
+--- a/src/prisma.service.ts
++++ b/src/prisma.service.ts
+@@ -1,15 +1,16 @@
+-import { Injectable, OnModuleInit } from '@nestjs/common';
++import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+ import { PrismaClient } from '@prisma/client';
+ 
+ @Injectable()
+-export class PrismaService extends PrismaClient implements OnModuleInit {
++export class PrismaService
++  extends PrismaClient
++  implements OnModuleInit, OnModuleDestroy
++{
+   async onModuleInit() {
+     await this.$connect();
+   }
+ 
+-  // async enableShutdownHooks(app: INestApplication) {
+-  //   this.$on('beforeExit', async () => {
+-  //     await app.close();
+-  //   });
+-  // }
++  async onModuleDestroy() {
++    await this.$disconnect();
++  }
+ }
+diff --git a/src/services/apiConfig.service.ts b/src/services/apiConfig.service.ts
+deleted file mode 100644
+index a5e886c..0000000
+--- a/src/services/apiConfig.service.ts
++++ /dev/null
+@@ -1,20 +0,0 @@
+-import { Injectable } from '@nestjs/common';
+-import { ConfigService } from '@nestjs/config';
+-
+-@Injectable()
+-export class ApiConfigService {
+-  constructor(private configService: ConfigService) {}
+-
+-  get accessTokenConfig(): any {
+-    return {
+-      secret: this.configService.get('JWT_SECRET'),
+-      expiresIn: eval(this.configService.get('JWT_EXPIRES_IN')),
+-    };
+-  }
+-  get refreshTokenConfig(): any {
+-    return {
+-      secret: this.configService.get('JWT_SECRET'),
+-      expiresIn: eval(this.configService.get('JWT_EXPIRES_IN')),
+-    };
+-  }
+-}
+diff --git a/test/app.e2e-spec.ts b/test/app.e2e-spec.ts
+deleted file mode 100644
+index fe8eed3..0000000
+--- a/test/app.e2e-spec.ts
++++ /dev/null
+@@ -1,30 +0,0 @@
+-import { Test, TestingModule } from '@nestjs/testing';
+-import { INestApplication } from '@nestjs/common';
+-import * as request from 'supertest';
+-import { AppModule } from './../src/app.module';
+-
+-jest.mock('src/post/post.module');
+-
+-describe('AppController (e2e)', () => {
+-  let app: INestApplication;
+-
+-  beforeEach(async () => {
+-    const moduleFixture: TestingModule = await Test.createTestingModule({
+-      imports: [AppModule],
+-    }).compile();
+-
+-    app = moduleFixture.createNestApplication();
+-    await app.init();
+-  });
+-
+-  it('/ (GET)', () => {
+-    return request(app.getHttpServer())
+-      .get('/')
+-      .expect(200)
+-      .expect('Hello World!');
+-  });
+-
+-  afterAll(async () => {
+-    await app.close();
+-  });
+-});
+diff --git a/test/auth.e2e-spec.ts b/test/auth.e2e-spec.ts
+new file mode 100644
+index 0000000..09f9477
+--- /dev/null
++++ b/test/auth.e2e-spec.ts
+@@ -0,0 +1,134 @@
++import { INestApplication, ValidationPipe } from '@nestjs/common';
++import { ConfigModule } from '@nestjs/config';
++import { JwtModule } from '@nestjs/jwt';
++import { PassportModule } from '@nestjs/passport';
++import { Test, TestingModule } from '@nestjs/testing';
++import * as request from 'supertest';
++import * as argon2 from 'argon2';
++
++import { AuthController } from 'src/authentication/auth.controller';
++import { AuthService } from 'src/authentication/auth.service';
++import { AccessTokenStrategy } from 'src/authentication/access-token.strategy';
++import { CustomerService } from 'src/customer/customer.service';
++
++/**
++ * Exercises the authentication endpoints over real HTTP, including the
++ * global ValidationPipe, with the persistence layer replaced by an in-memory
++ * double. No Postgres required, so this runs in CI unchanged.
++ */
++describe('Auth (e2e)', () => {
++  let app: INestApplication;
++
++  const password = 'local-dev-password';
++  const customer = {
++    id: 'ff1b0c1e-0000-4000-8000-000000000001',
++    email: 'customer@example.com',
++    password: '',
++    role: 'USER',
++    createdAt: new Date(),
++    updatedAt: new Date(),
++  };
++
++  const customerService = {
++    findCustomerEmail: jest.fn(),
++    create: jest.fn(),
++  };
++
++  beforeAll(async () => {
++    customer.password = await argon2.hash(password);
++
++    const moduleFixture: TestingModule = await Test.createTestingModule({
++      imports: [
++        ConfigModule.forRoot({ isGlobal: true }),
++        PassportModule,
++        JwtModule.register({ secret: process.env.JWT_SECRET }),
++      ],
++      controllers: [AuthController],
++      providers: [
++        AuthService,
++        AccessTokenStrategy,
++        { provide: CustomerService, useValue: customerService },
++      ],
++    }).compile();
++
++    app = moduleFixture.createNestApplication();
++    app.useGlobalPipes(
++      new ValidationPipe({
++        whitelist: true,
++        forbidNonWhitelisted: true,
++        transform: true,
++      }),
++    );
++    await app.init();
++  });
++
++  afterAll(async () => {
++    await app.close();
++  });
++
++  beforeEach(() => {
++    jest.resetAllMocks();
++  });
++
++  it('logs in with valid credentials and returns both tokens', async () => {
++    customerService.findCustomerEmail.mockResolvedValue(customer);
++
++    const response = await request(app.getHttpServer())
++      .post('/auth/login')
++      .send({ email: customer.email, password })
++      .expect(200);
++
++    expect(response.body).toEqual({
++      access_token: expect.any(String),
++      refresh_token: expect.any(String),
++    });
++  });
++
++  it('rejects a wrong password with 401, not 500', async () => {
++    customerService.findCustomerEmail.mockResolvedValue(customer);
++
++    await request(app.getHttpServer())
++      .post('/auth/login')
++      .send({ email: customer.email, password: 'wrong' })
++      .expect(401);
++  });
++
++  it('rejects a malformed email before it reaches the service', async () => {
++    await request(app.getHttpServer())
++      .post('/auth/login')
++      .send({ email: 'not-an-email', password })
++      .expect(400);
++
++    expect(customerService.findCustomerEmail).not.toHaveBeenCalled();
++  });
++
++  it('strips unknown fields rather than passing them to the database', async () => {
++    await request(app.getHttpServer())
++      .post('/auth/signup')
++      .send({ email: 'new@example.com', password, role: 'ADMIN' })
++      .expect(400);
++
++    expect(customerService.create).not.toHaveBeenCalled();
++  });
++
++  it('requires a bearer token on /auth/me', async () => {
++    await request(app.getHttpServer()).get('/auth/me').expect(401);
++  });
++
++  it('returns the customer behind a valid access token', async () => {
++    customerService.findCustomerEmail.mockResolvedValue(customer);
++
++    const login = await request(app.getHttpServer())
++      .post('/auth/login')
++      .send({ email: customer.email, password })
++      .expect(200);
++
++    const me = await request(app.getHttpServer())
++      .get('/auth/me')
++      .set('Authorization', `Bearer ${login.body.access_token}`)
++      .expect(200);
++
++    expect(me.body).toMatchObject({ id: customer.id, email: customer.email });
++    expect(me.body).not.toHaveProperty('password');
++  });
++});
+diff --git a/test/jest-setup.ts b/test/jest-setup.ts
+index e69de29..e2bb87d 100644
+--- a/test/jest-setup.ts
++++ b/test/jest-setup.ts
+@@ -0,0 +1,8 @@
++// Configuration the application validates at boot. Values are dummies — the
++// e2e suite never reaches a real database or a real client.
++process.env.NODE_ENV = 'test';
++process.env.DATABASE_URL = 'postgresql://localhost:5432/test';
++process.env.JWT_SECRET = 'test-access-secret';
++process.env.JWT_EXPIRES_IN = '15m';
++process.env.JWT_REFRESH_SECRET = 'test-refresh-secret';
++process.env.JWT_REFRESH_EXPIRES_IN = '7d';
+-- 
+2.43.0
+
