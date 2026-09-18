@@ -1,18 +1,22 @@
-import { Query, Resolver } from '@nestjs/graphql';
-import { Customer } from 'lib/entities/customer.entity';
+import { Args, Query, Resolver } from '@nestjs/graphql';
+import { UseGuards } from '@nestjs/common';
+import { Customer } from 'src/lib/entities/customer.entity';
 import { CustomerService } from './customer.service';
-// import { GetCustomerInput } from './dto/customer.input';
+import { ListCustomersInput } from './dto/customer.input';
+import { JwtAuthGuard } from 'src/authentication/jwt-auth.guard';
 
 @Resolver(() => Customer)
+@UseGuards(JwtAuthGuard)
 export class CustomerResolver {
   constructor(private readonly customerService: CustomerService) {}
 
   @Query(() => [Customer])
-  async customers() {
-    return this.customerService.findAll();
+  customers(
+    @Args('input', { nullable: true }) input?: ListCustomersInput,
+  ): Promise<Customer[]> {
+    return this.customerService.findAll({
+      skip: input?.skip,
+      take: input?.take,
+    }) as Promise<Customer[]>;
   }
-  // @Query(() => [Customer])
-  // async customers(@Args('data') { skip, take, where }: GetCustomerInput) {
-  //   return this.customerService.findAll({ skip, take, where });
-  // }
 }

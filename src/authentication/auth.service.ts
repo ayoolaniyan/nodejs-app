@@ -1,18 +1,28 @@
-import { ForbiddenException, Injectable } from '@nestjs/common';
+import {
+  ConflictException,
+  Injectable,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { CustomerService } from 'src/customer/customer.service';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import * as argon2 from 'argon2';
 
-type Tokens = {
+export type Tokens = {
   access_token: string;
   refresh_token: string;
 };
 
-type JwtPayload = {
-  email: string;
+/**
+ * Claims carried by both tokens. `sub` is the customer id — never the
+ * password or its hash, since a JWT payload is readable by anyone holding
+ * the token.
+ */
+export type JwtPayload = {
   sub: string;
+  email: string;
+  role: string;
 };
 
 @Injectable()
@@ -20,97 +30,84 @@ export class AuthService {
   constructor(
     private readonly jwtService: JwtService,
     private readonly customerService: CustomerService,
-    private configService: ConfigService,
+    private readonly configService: ConfigService,
   ) {}
 
-  async validateCustomer(addCustomer: Prisma.CustomerWhereUniqueInput) {
-    const customer = await this.customerService.findCustomerEmail(addCustomer);
-    if (customer && customer.email === addCustomer.email) {
-      const { email, ...result } = customer;
-      return result;
+  /**
+   * Looks up a customer by email and returns them without the password hash.
+   * Used by the JWT strategy to turn a token's claims back into a customer.
+   */
+  async validateCustomer(where: Prisma.CustomerWhereUniqueInput) {
+    const customer = await this.customerService.findCustomerEmail(where);
+    if (!customer) {
+      return null;
     }
-    return null;
+    const { password: _password, ...safeCustomer } = customer;
+    return safeCustomer;
   }
 
-  async signup(addCustomer: Prisma.CustomerCreateInput) {
-    const hashPassword = await argon2.hash((await addCustomer).password);
-    const payload: Prisma.CustomerCreateInput = {
-      email: (await addCustomer).email,
-      password: hashPassword,
-    };
-    const customer = await this.customerService
-      .create(payload)
-      .catch((error) => {
-        throw error || new ForbiddenException('Access Denied');
-      });
-    const accessToken = await this.getTokens(
-      (
-        await customer
-      ).email,
-      (
-        await customer
-      ).password,
-    );
-    return accessToken;
+  async signup(input: Prisma.CustomerCreateInput): Promise<Tokens> {
+    const existing = await this.customerService.findCustomerEmail({
+      email: input.email,
+    });
+    if (existing) {
+      // Deliberately the same wording the login path uses, so that signup
+      // cannot be used to enumerate which email addresses are registered.
+      throw new ConflictException('Unable to create account');
+    }
+
+    const customer = await this.customerService.create({
+      email: input.email,
+      password: await argon2.hash(input.password),
+    });
+
+    return this.getTokens(customer.id, customer.email, customer.role);
   }
 
-  async login(addCustomer: Prisma.CustomerWhereUniqueInput) {
-    const customer = await this.customerService.findCustomerEmail(addCustomer);
+  async login(credentials: Prisma.CustomerWhereUniqueInput): Promise<Tokens> {
+    const customer = await this.customerService.findCustomerEmail({
+      email: credentials.email,
+    });
 
-    console.log('customer', customer);
-
-    const payload = {
-      email: customer.email,
-      sub: customer.password,
-    };
+    // One error for "no such customer" and "wrong password" alike: telling
+    // them apart hands an attacker a list of valid accounts.
+    if (!customer) {
+      throw new UnauthorizedException('Invalid credentials');
+    }
 
     const passwordMatches = await argon2.verify(
       customer.password,
-      addCustomer.password.toString(),
+      String(credentials.password),
     );
+    if (!passwordMatches) {
+      throw new UnauthorizedException('Invalid credentials');
+    }
 
-    if (!passwordMatches) throw new ForbiddenException('Access Denied');
-
-    const accessToken = await this.getTokens(
-      (
-        await customer
-      ).email,
-      (
-        await customer
-      ).password,
-    );
-    console.log('token', accessToken);
-
-    this.jwtService.signAsync(payload);
-    return accessToken;
+    return this.getTokens(customer.id, customer.email, customer.role);
   }
 
-  async getTokens(email: string, password: string): Promise<Tokens> {
-    const jwtPayload: JwtPayload = {
-      sub: password,
-      email: email,
-    };
-    const [at, rt] = await Promise.all([
-      this.jwtService.signAsync(jwtPayload, {
-        secret: this.configService.get('JWT_SECRET'),
-        expiresIn: this.configService.get('JWT_EXPIRES_IN'),
+  async getTokens(id: string, email: string, role: string): Promise<Tokens> {
+    const payload: JwtPayload = { sub: id, email, role };
+
+    const [accessToken, refreshToken] = await Promise.all([
+      this.jwtService.signAsync(payload, {
+        secret: this.configService.get<string>('JWT_SECRET'),
+        expiresIn: this.configService.get<string>('JWT_EXPIRES_IN'),
       }),
-      this.jwtService.signAsync(jwtPayload, {
-        secret: this.configService.get('JWT_REFRESH_SECRET'),
-        expiresIn: this.configService.get('JWT_EXPIRES_IN'),
+      this.jwtService.signAsync(payload, {
+        secret: this.configService.get<string>('JWT_REFRESH_SECRET'),
+        expiresIn: this.configService.get<string>('JWT_REFRESH_EXPIRES_IN'),
       }),
     ]);
-    return {
-      access_token: at,
-      refresh_token: rt,
-    };
+
+    return { access_token: accessToken, refresh_token: refreshToken };
   }
 
   async refreshTokens(email: string): Promise<Tokens> {
     const customer = await this.customerService.findCustomerEmail({ email });
-
-    const tokens = await this.getTokens(customer.email, customer.password);
-
-    return tokens;
+    if (!customer) {
+      throw new UnauthorizedException('Invalid credentials');
+    }
+    return this.getTokens(customer.id, customer.email, customer.role);
   }
 }

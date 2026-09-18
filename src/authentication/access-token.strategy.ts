@@ -1,29 +1,34 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PassportStrategy } from '@nestjs/passport';
-import { Prisma } from '@prisma/client';
 import { Strategy, ExtractJwt } from 'passport-jwt';
-import { AuthService } from './auth.service';
+import { AuthService, JwtPayload } from './auth.service';
 
 @Injectable()
-export class AccessTokenStrategy extends PassportStrategy(Strategy) {
+export class AccessTokenStrategy extends PassportStrategy(Strategy, 'jwt') {
   constructor(
-    private configService: ConfigService,
-    private authService: AuthService,
+    configService: ConfigService,
+    private readonly authService: AuthService,
   ) {
     super({
       jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
       ignoreExpiration: false,
-      secretOrKey: configService.get('JWT_SECRET'),
+      secretOrKey: configService.get<string>('JWT_SECRET'),
     });
   }
 
-  async validate(customerDetails: Prisma.CustomerWhereUniqueInput) {
-    const payload: Prisma.CustomerWhereUniqueInput = {
-      email: customerDetails.email,
-    };
-    const customer = await this.authService.validateCustomer(payload);
-
+  /**
+   * Passport has already verified the signature and expiry by this point.
+   * The customer is re-read from the database so that a token issued before
+   * an account was deleted or its role changed does not keep working.
+   */
+  async validate(payload: JwtPayload) {
+    const customer = await this.authService.validateCustomer({
+      email: payload.email,
+    });
+    if (!customer) {
+      throw new UnauthorizedException();
+    }
     return customer;
   }
 }

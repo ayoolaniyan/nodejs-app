@@ -1,78 +1,89 @@
-import { ForbiddenException, Injectable } from '@nestjs/common';
-import { PrismaService } from 'src/prisma.service';
-import { WhereCustomerInput } from './dto/customer.input';
+import { Injectable, NotFoundException } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
-import { JwtService } from '@nestjs/jwt';
 import { PrismaClientKnownRequestError } from '@prisma/client/runtime/library';
+import { PrismaService } from 'src/prisma.service';
+import { UpdateCustomerInput } from './dto/customer.input';
+
+/** Columns returned to callers — the password hash is never among them. */
+const publicCustomerFields: Prisma.CustomerSelect = {
+  id: true,
+  email: true,
+  role: true,
+  createdAt: true,
+  updatedAt: true,
+};
 
 @Injectable()
 export class CustomerService {
-  constructor(
-    private prisma: PrismaService,
-    private readonly jwtService: JwtService,
-  ) {}
+  constructor(private readonly prisma: PrismaService) {}
 
-  async findAll() {
-    const result = this.prisma.customer.findMany().catch((error) => {
-      if (error instanceof PrismaClientKnownRequestError) {
-        throw new ForbiddenException('Credentials incorrect');
-      }
-      throw error;
+  findAll(params: { skip?: number; take?: number } = {}) {
+    const { skip = 0, take = 25 } = params;
+    return this.prisma.customer.findMany({
+      skip,
+      // Capped so that a caller cannot ask for the entire table in one query.
+      take: Math.min(take, 100),
+      orderBy: { createdAt: 'desc' },
+      select: publicCustomerFields,
     });
-    return result;
   }
-  // async findAll(params: GetCustomerInput) {
-  //   const { skip, take, cursor, where } = params;
 
-  //   return this.prisma.customer.findMany({
-  //     skip,
-  //     take,
-  //     cursor,
-  //     where,
-  //   });
-  // }
-
-  async findCustomerEmail(customer: Prisma.CustomerWhereUniqueInput) {
+  /**
+   * Returns the full record including the password hash. Only the
+   * authentication layer should call this.
+   */
+  findCustomerEmail(where: Prisma.CustomerWhereUniqueInput) {
     return this.prisma.customer.findUnique({
-      where: {
-        email: customer.email,
-      },
+      where: { email: where.email },
     });
   }
 
-  async create(addCustomer: Prisma.CustomerCreateInput) {
-    const result = this.prisma.customer.create({
-      data: addCustomer,
+  findById(id: string) {
+    return this.prisma.customer.findUnique({
+      where: { id },
+      select: publicCustomerFields,
     });
-    return result;
   }
 
-  async updateById(id: string, updateCustomer: WhereCustomerInput) {
-    const result = this.prisma.customer
-      .update({
-        where: { id: id },
-        data: updateCustomer,
-      })
-      .catch((error) => {
-        if (error instanceof PrismaClientKnownRequestError) {
-          throw new ForbiddenException('Credentials incorrect');
-        }
-        throw error;
-      });
-    return result;
+  create(data: Prisma.CustomerCreateInput) {
+    return this.prisma.customer.create({ data });
   }
 
-  async deleteById(id: Prisma.CustomerWhereUniqueInput) {
-    const result = this.prisma.customer
-      .delete({
-        where: id,
-      })
-      .catch((error) => {
-        if (error instanceof PrismaClientKnownRequestError) {
-          throw new ForbiddenException('Credentials incorrect');
-        }
-        throw error;
+  async updateById(id: string, data: UpdateCustomerInput) {
+    try {
+      return await this.prisma.customer.update({
+        where: { id },
+        data,
+        select: publicCustomerFields,
       });
-    return result;
+    } catch (error) {
+      throw this.translatePrismaError(error, id);
+    }
+  }
+
+  async deleteById(id: string) {
+    try {
+      return await this.prisma.customer.delete({
+        where: { id },
+        select: publicCustomerFields,
+      });
+    } catch (error) {
+      throw this.translatePrismaError(error, id);
+    }
+  }
+
+  /**
+   * Prisma reports a missing row as P2025. Previously this surfaced as a
+   * 403 "Credentials incorrect", which is neither the right status nor an
+   * accurate description of what happened.
+   */
+  private translatePrismaError(error: unknown, id: string): unknown {
+    if (
+      error instanceof PrismaClientKnownRequestError &&
+      error.code === 'P2025'
+    ) {
+      return new NotFoundException(`Customer ${id} not found`);
+    }
+    return error;
   }
 }
