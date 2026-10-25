@@ -23,8 +23,7 @@ export class RolesGuard implements CanActivate {
     // signed token. Reading it from the request body would let any caller
     // grant themselves a role simply by sending one.
     const user = requestFromContext(context).user as
-      | AuthenticatedCustomer
-      | undefined;
+      AuthenticatedCustomer | undefined;
     if (!user?.role) {
       return false;
     }

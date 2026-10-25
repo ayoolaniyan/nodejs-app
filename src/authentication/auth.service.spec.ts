@@ -50,7 +50,7 @@ describe('AuthService', () => {
         { provide: CustomerService, useValue: customerService },
         {
           provide: ConfigService,
-          useValue: { get: (key: string) => env[key] },
+          useValue: { getOrThrow: (key: string) => env[key] },
         },
       ],
     }).compile();
@@ -87,6 +87,15 @@ describe('AuthService', () => {
     return calls[calls.length - 1][1];
   }
 
+  /** As lastStoredRefreshHash, for tests where a hash must have been stored. */
+  function currentRefreshHash(): string {
+    const hash = lastStoredRefreshHash();
+    if (hash === null) {
+      throw new Error('Expected a refresh token hash to have been stored');
+    }
+    return hash;
+  }
+
   describe('login', () => {
     it('issues tokens whose subject is the customer id, never the password hash', async () => {
       const tokens = await loginAsExistingCustomer();
@@ -119,7 +128,7 @@ describe('AuthService', () => {
     it('stores a hash of the refresh token rather than the token itself', async () => {
       const tokens = await loginAsExistingCustomer();
 
-      const stored = lastStoredRefreshHash();
+      const stored = currentRefreshHash();
       expect(customerService.setRefreshTokenHash).toHaveBeenCalledWith(
         existingCustomer.id,
         expect.any(String),
@@ -220,7 +229,7 @@ describe('AuthService', () => {
       );
 
       expect(second.refresh_token).not.toBe(first.refresh_token);
-      const rotated = lastStoredRefreshHash();
+      const rotated = currentRefreshHash();
       expect(await argon2.verify(rotated, second.refresh_token)).toBe(true);
       expect(await argon2.verify(rotated, first.refresh_token)).toBe(false);
     });

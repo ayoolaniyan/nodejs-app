@@ -1,5 +1,5 @@
 import { Module } from '@nestjs/common';
-import { ConfigModule, ConfigService } from '@nestjs/config';
+import { ConfigModule } from '@nestjs/config';
 import { JwtModule } from '@nestjs/jwt';
 import { PassportModule } from '@nestjs/passport';
 import { AuthController } from './auth.controller';
@@ -13,16 +13,9 @@ import { CustomerModule } from 'src/customer/customer.module';
   imports: [
     PassportModule,
     ConfigModule,
-    JwtModule.registerAsync({
-      imports: [ConfigModule],
-      inject: [ConfigService],
-      useFactory: (configService: ConfigService) => ({
-        secret: configService.get<string>('JWT_SECRET'),
-        signOptions: {
-          expiresIn: configService.get<string>('JWT_EXPIRES_IN'),
-        },
-      }),
-    }),
+    // No defaults: AuthService passes the secret and expiry for each token
+    // type explicitly, and the passport strategies verify with their own.
+    JwtModule.register({}),
     CustomerModule,
   ],
   controllers: [AuthController],

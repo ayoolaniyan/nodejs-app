@@ -6,6 +6,7 @@ import { GraphQLModule } from '@nestjs/graphql';
 import { ApolloDriver, ApolloDriverConfig } from '@nestjs/apollo';
 import { Test, TestingModule } from '@nestjs/testing';
 import * as request from 'supertest';
+import { Request } from 'express';
 
 import { AuthService } from 'src/authentication/auth.service';
 import { AccessTokenStrategy } from 'src/authentication/access-token.strategy';
@@ -54,7 +55,7 @@ describe('Customers (e2e)', () => {
         GraphQLModule.forRoot<ApolloDriverConfig>({
           driver: ApolloDriver,
           autoSchemaFile: true,
-          context: ({ req }) => ({ req }),
+          context: ({ req }: { req: Request }) => ({ req }),
         }),
       ],
       controllers: [CustomerController],
