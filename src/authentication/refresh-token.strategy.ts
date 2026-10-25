@@ -5,6 +5,9 @@ import { Request } from 'express';
 import { Strategy, ExtractJwt } from 'passport-jwt';
 import { JwtPayload } from './auth.service';
 
+/** What the refresh-token strategy places on `request.user`. */
+export type RefreshTokenPrincipal = JwtPayload & { refreshToken: string };
+
 @Injectable()
 export class RefreshTokenStrategy extends PassportStrategy(
   Strategy,
@@ -21,7 +24,10 @@ export class RefreshTokenStrategy extends PassportStrategy(
     });
   }
 
-  async validate(req: Request, payload: JwtPayload) {
+  async validate(
+    req: Request,
+    payload: JwtPayload,
+  ): Promise<RefreshTokenPrincipal> {
     const refreshToken = (req.get('Authorization') ?? '')
       .replace('Bearer', '')
       .trim();

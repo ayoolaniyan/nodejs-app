@@ -6,7 +6,7 @@ import { ConfigModule } from '@nestjs/config';
 
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
-import { PrismaService } from './prisma.service';
+import { PrismaModule } from './prisma.module';
 import { CustomerModule } from './customer/customer.module';
 import { AuthModule } from './authentication/auth.module';
 import { validateEnv } from './config/env.validation';
@@ -26,11 +26,15 @@ import { validateEnv } from './config/env.validation';
       // so they are limited to non-production environments.
       playground: process.env.NODE_ENV !== 'production',
       introspection: process.env.NODE_ENV !== 'production',
+      // Exposes the HTTP request to resolvers, which is where JwtAuthGuard
+      // finds the bearer token.
+      context: ({ req }) => ({ req }),
     }),
+    PrismaModule,
     CustomerModule,
     AuthModule,
   ],
   controllers: [AppController],
-  providers: [AppService, PrismaService],
+  providers: [AppService],
 })
 export class AppModule {}

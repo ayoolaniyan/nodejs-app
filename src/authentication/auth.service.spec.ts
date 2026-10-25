@@ -17,7 +17,14 @@ describe('AuthService', () => {
   let authService: AuthService;
   let jwtService: JwtService;
   let customerService: jest.Mocked<
-    Pick<CustomerService, 'findCustomerEmail' | 'create'>
+    Pick<
+      CustomerService,
+      | 'findCustomerEmail'
+      | 'findById'
+      | 'findAuthRecordById'
+      | 'create'
+      | 'setRefreshTokenHash'
+    >
   >;
 
   const storedPassword = 'correct-horse-battery';
@@ -30,7 +37,10 @@ describe('AuthService', () => {
   beforeEach(async () => {
     customerService = {
       findCustomerEmail: jest.fn(),
+      findById: jest.fn(),
+      findAuthRecordById: jest.fn(),
       create: jest.fn(),
+      setRefreshTokenHash: jest.fn(),
     };
 
     const moduleRef = await Test.createTestingModule({
@@ -54,21 +64,32 @@ describe('AuthService', () => {
     email: 'customer@example.com',
     password: '',
     role: 'USER',
+    refreshTokenHash: null as string | null,
     createdAt: new Date(),
     updatedAt: new Date(),
   };
 
+  function loginAsExistingCustomer() {
+    customerService.findCustomerEmail.mockResolvedValue({
+      ...existingCustomer,
+      password: storedHash,
+    } as never);
+
+    return authService.login({
+      email: existingCustomer.email,
+      password: storedPassword,
+    } as never);
+  }
+
+  /** The refresh token hash most recently passed to setRefreshTokenHash. */
+  function lastStoredRefreshHash(): string | null {
+    const calls = customerService.setRefreshTokenHash.mock.calls;
+    return calls[calls.length - 1][1];
+  }
+
   describe('login', () => {
     it('issues tokens whose subject is the customer id, never the password hash', async () => {
-      customerService.findCustomerEmail.mockResolvedValue({
-        ...existingCustomer,
-        password: storedHash,
-      } as never);
-
-      const tokens = await authService.login({
-        email: existingCustomer.email,
-        password: storedPassword,
-      } as never);
+      const tokens = await loginAsExistingCustomer();
 
       const claims = jwtService.decode(tokens.access_token) as Record<
         string,
@@ -83,15 +104,7 @@ describe('AuthService', () => {
     });
 
     it('signs the refresh token with a different secret than the access token', async () => {
-      customerService.findCustomerEmail.mockResolvedValue({
-        ...existingCustomer,
-        password: storedHash,
-      } as never);
-
-      const tokens = await authService.login({
-        email: existingCustomer.email,
-        password: storedPassword,
-      } as never);
+      const tokens = await loginAsExistingCustomer();
 
       expect(() =>
         jwtService.verify(tokens.refresh_token, { secret: env.JWT_SECRET }),
@@ -101,6 +114,18 @@ describe('AuthService', () => {
           secret: env.JWT_REFRESH_SECRET,
         }),
       ).toMatchObject({ sub: existingCustomer.id });
+    });
+
+    it('stores a hash of the refresh token rather than the token itself', async () => {
+      const tokens = await loginAsExistingCustomer();
+
+      const stored = lastStoredRefreshHash();
+      expect(customerService.setRefreshTokenHash).toHaveBeenCalledWith(
+        existingCustomer.id,
+        expect.any(String),
+      );
+      expect(stored).not.toBe(tokens.refresh_token);
+      expect(await argon2.verify(stored, tokens.refresh_token)).toBe(true);
     });
 
     it('rejects a wrong password', async () => {
@@ -132,12 +157,12 @@ describe('AuthService', () => {
   describe('signup', () => {
     it('stores a hash rather than the password itself', async () => {
       customerService.findCustomerEmail.mockResolvedValue(null as never);
-      customerService.create.mockImplementation(
-        (async (data: Record<string, unknown>) => ({
-          ...existingCustomer,
-          ...data,
-        })) as never,
-      );
+      customerService.create.mockImplementation((async (
+        data: Record<string, unknown>,
+      ) => ({
+        ...existingCustomer,
+        ...data,
+      })) as never);
 
       await authService.signup({
         email: 'new@example.com',
@@ -164,18 +189,72 @@ describe('AuthService', () => {
     });
   });
 
-  describe('validateCustomer', () => {
-    it('never returns the password hash', async () => {
-      customerService.findCustomerEmail.mockResolvedValue({
+  describe('refreshTokens', () => {
+    it('exchanges the current refresh token for a new pair and rotates it', async () => {
+      const first = await loginAsExistingCustomer();
+      customerService.findAuthRecordById.mockResolvedValue({
         ...existingCustomer,
-        password: storedHash,
+        refreshTokenHash: lastStoredRefreshHash(),
       } as never);
 
-      const customer = await authService.validateCustomer({
-        email: existingCustomer.email,
-      });
+      const second = await authService.refreshTokens(
+        existingCustomer.id,
+        first.refresh_token,
+      );
 
-      expect(customer).not.toHaveProperty('password');
+      expect(second.refresh_token).not.toBe(first.refresh_token);
+      const rotated = lastStoredRefreshHash();
+      expect(await argon2.verify(rotated, second.refresh_token)).toBe(true);
+      expect(await argon2.verify(rotated, first.refresh_token)).toBe(false);
+    });
+
+    it('rejects a refresh token that has already been rotated away', async () => {
+      const first = await loginAsExistingCustomer();
+      await loginAsExistingCustomer();
+      customerService.findAuthRecordById.mockResolvedValue({
+        ...existingCustomer,
+        refreshTokenHash: lastStoredRefreshHash(),
+      } as never);
+
+      await expect(
+        authService.refreshTokens(existingCustomer.id, first.refresh_token),
+      ).rejects.toBeInstanceOf(UnauthorizedException);
+    });
+
+    it('rejects any refresh token after logout', async () => {
+      const tokens = await loginAsExistingCustomer();
+      await authService.logout(existingCustomer.id);
+      expect(lastStoredRefreshHash()).toBeNull();
+      customerService.findAuthRecordById.mockResolvedValue({
+        ...existingCustomer,
+        refreshTokenHash: null,
+      } as never);
+
+      await expect(
+        authService.refreshTokens(existingCustomer.id, tokens.refresh_token),
+      ).rejects.toBeInstanceOf(UnauthorizedException);
+    });
+
+    it('rejects a refresh token for a customer that no longer exists', async () => {
+      customerService.findAuthRecordById.mockResolvedValue(null as never);
+
+      await expect(
+        authService.refreshTokens(existingCustomer.id, 'any-token'),
+      ).rejects.toBeInstanceOf(UnauthorizedException);
+    });
+  });
+
+  describe('validateCustomer', () => {
+    it('looks the customer up by id, not by the email claim', async () => {
+      const { password: _p, refreshTokenHash: _r, ...safe } = existingCustomer;
+      customerService.findById.mockResolvedValue(safe as never);
+
+      const customer = await authService.validateCustomer(existingCustomer.id);
+
+      expect(customerService.findById).toHaveBeenCalledWith(
+        existingCustomer.id,
+      );
+      expect(customerService.findCustomerEmail).not.toHaveBeenCalled();
       expect(customer).toMatchObject({ id: existingCustomer.id });
     });
   });

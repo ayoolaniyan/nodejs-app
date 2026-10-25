@@ -6,7 +6,7 @@ persistence.
 
 It began as a take-home exercise and is kept here as a working reference for
 how I structure a Nest service: thin controllers, business rules in services,
-persistence behind Prisma, and authorisation decided by guards rather than by
+persistence behind Prisma, and authorisation decided by guards not by
 the code inside each handler.
 
 ## Stack
@@ -54,15 +54,21 @@ every push via GitHub Actions.
 | --- | --- |
 | `POST /auth/signup` | public |
 | `POST /auth/login` | public |
-| `GET /auth/me` | any authenticated customer |
-| `GET /customers`, `GET /customers/:id`, `PATCH /customers/:id` | any authenticated customer |
-| `DELETE /customers/:id` | `ADMIN` only |
+| `POST /auth/refresh` | a valid refresh token |
+| `POST /auth/logout`, `GET /auth/me` | any authenticated customer |
+| `GET /customers/:id`, `PATCH /customers/:id` | that customer, or `ADMIN` |
+| `GET /customers`, GraphQL `customers`, `DELETE /customers/:id` | `ADMIN` only |
 
 Access and refresh tokens are signed with **different** secrets, and the
-application refuses to start if they are equal — otherwise a refresh token
+application refuses to start if they are equal, otherwise a refresh token
 would be accepted anywhere an access token is. Token claims carry the
 customer id, email and role; a JWT payload is base64, not encryption, so
 nothing secret goes in it.
+
+Refresh tokens are rotated: `/auth/refresh` accepts only the most recently
+issued one (its argon2 hash is stored on the customer) and replaces it, and
+`/auth/logout` clears it. Access tokens are not revocable and remain valid
+until they expire, so `JWT_EXPIRES_IN` should stay short.
 
 ## Notable design decisions
 
@@ -78,11 +84,11 @@ the endpoints cannot be used to enumerate registered addresses.
 
 **The JWT strategy re-reads the customer on each request.** Slightly more
 work per call, but a token minted before a role change or an account
-deletion stops working immediately rather than at expiry.
+deletion stops working immediately.
 
 **Configuration is validated at boot.** `validateEnv` fails fast on missing
 variables. Without it, an absent `JWT_SECRET` produces tokens signed with
-`undefined` — which look perfectly valid until something tries to verify
+`undefined` which look perfectly valid until something tries to verify
 them.
 
 **Selects are explicit.** Read paths use a `publicCustomerFields` select so

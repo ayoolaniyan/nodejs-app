@@ -2,6 +2,8 @@ import { Injectable, CanActivate, ExecutionContext } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import { Role } from './enums/role.enum';
 import { ROLES_KEY } from './decorators/roles.decorator';
+import { requestFromContext } from '../request-from-context';
+import { AuthenticatedCustomer } from '../auth.service';
 
 @Injectable()
 export class RolesGuard implements CanActivate {
@@ -20,7 +22,9 @@ export class RolesGuard implements CanActivate {
     // The role is read from the authenticated principal, which comes from a
     // signed token. Reading it from the request body would let any caller
     // grant themselves a role simply by sending one.
-    const { user } = context.switchToHttp().getRequest();
+    const user = requestFromContext(context).user as
+      | AuthenticatedCustomer
+      | undefined;
     if (!user?.role) {
       return false;
     }
