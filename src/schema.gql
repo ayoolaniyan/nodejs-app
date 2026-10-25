@@ -11,6 +11,7 @@ type Customer {
   """Date and time when the object was updated last time."""
   updatedAt: Timestamp!
   email: String!
+  role: String!
 }
 
 """
@@ -19,5 +20,10 @@ type Customer {
 scalar Timestamp
 
 type Query {
-  customers: [Customer!]!
+  customers(input: ListCustomersInput): [Customer!]!
+}
+
+input ListCustomersInput {
+  skip: Int = 0
+  take: Int = 25
 }

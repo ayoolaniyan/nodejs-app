@@ -35,6 +35,9 @@ export type AuthenticatedCustomer = {
 
 @Injectable()
 export class AuthService {
+  /** Verified against when a login names an unknown email; see login(). */
+  private readonly dummyHash = argon2.hash(randomUUID());
+
   constructor(
     private readonly jwtService: JwtService,
     private readonly customerService: CustomerService,
@@ -55,8 +58,9 @@ export class AuthService {
       email: input.email,
     });
     if (existing) {
-      // Deliberately the same wording the login path uses, so that signup
-      // cannot be used to enumerate which email addresses are registered.
+      // This 409 necessarily tells the caller that the email is registered.
+      // Hiding that would need a verification flow that answers every
+      // signup with "check your inbox", which this service does not have.
       throw new ConflictException('Unable to create account');
     }
 
@@ -73,17 +77,18 @@ export class AuthService {
       email: credentials.email,
     });
 
-    // One error for "no such customer" and "wrong password" alike: telling
-    // them apart hands an attacker a list of valid accounts.
-    if (!customer) {
-      throw new UnauthorizedException('Invalid credentials');
-    }
-
+    // An unknown email is checked against a dummy hash so that it costs the
+    // same argon2 work as a wrong password. Returning early would make
+    // misses measurably faster, and response time alone would then reveal
+    // which emails are registered.
     const passwordMatches = await argon2.verify(
-      customer.password,
+      customer?.password ?? (await this.dummyHash),
       String(credentials.password),
     );
-    if (!passwordMatches) {
+
+    // One error for "no such customer" and "wrong password" alike: telling
+    // them apart hands an attacker a list of valid accounts.
+    if (!customer || !passwordMatches) {
       throw new UnauthorizedException('Invalid credentials');
     }
 

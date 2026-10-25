@@ -6,7 +6,7 @@ persistence.
 
 It began as a take-home exercise and is kept here as a working reference for
 how I structure a Nest service: thin controllers, business rules in services,
-persistence behind Prisma, and authorisation decided by guards not by
+persistence behind Prisma, and authorisation decided by guards rather than by
 the code inside each handler.
 
 ## Stack
@@ -78,9 +78,13 @@ strategy from a signed token. An earlier version read it from the request
 body, which let any caller grant themselves a role by sending one; there is
 a regression test for exactly that case in `roles.guard.spec.ts`.
 
-**Login and signup fail identically for unknown and known accounts.** Both
-return the same error whether the email exists or the password is wrong, so
-the endpoints cannot be used to enumerate registered addresses.
+**Login does not reveal which accounts exist.** An unknown email and a
+wrong password get the same 401, and both cost one argon2 verification (an
+unknown email is checked against a dummy hash), so neither the response nor
+its timing tells them apart. Signup is different: it must return 409 for an
+email that is already registered, so it does reveal that the address has an
+account. Closing that would need an email-verification signup flow, which
+this service does not implement.
 
 **The JWT strategy re-reads the customer on each request.** Slightly more
 work per call, but a token minted before a role change or an account
@@ -88,12 +92,14 @@ deletion stops working immediately.
 
 **Configuration is validated at boot.** `validateEnv` fails fast on missing
 variables. Without it, an absent `JWT_SECRET` produces tokens signed with
-`undefined` which look perfectly valid until something tries to verify
+`undefined`, which look perfectly valid until something tries to verify
 them.
 
 **Selects are explicit.** Read paths use a `publicCustomerFields` select so
-the password hash cannot reach a response by accident; the one method that
-returns the full record is documented as being for the auth layer only.
+neither the password hash nor the refresh token hash can reach a response
+by accident. The two methods that return the full record
+(`findCustomerEmail` and `findAuthRecordById`) are documented as being for
+the auth layer only.
 
 ## Repository layout
 
