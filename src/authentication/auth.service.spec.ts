@@ -152,6 +152,23 @@ describe('AuthService', () => {
         } as never),
       ).rejects.toBeInstanceOf(UnauthorizedException);
     });
+
+    it('spends the same argon2 work on an unknown email as on a wrong password', async () => {
+      // Returning before argon2 would make misses measurably faster, and
+      // response time alone would reveal which emails are registered.
+      const verify = jest.spyOn(argon2, 'verify');
+      customerService.findCustomerEmail.mockResolvedValue(null as never);
+
+      await expect(
+        authService.login({
+          email: 'nobody@example.com',
+          password: storedPassword,
+        } as never),
+      ).rejects.toBeInstanceOf(UnauthorizedException);
+
+      expect(verify).toHaveBeenCalledTimes(1);
+      verify.mockRestore();
+    });
   });
 
   describe('signup', () => {
