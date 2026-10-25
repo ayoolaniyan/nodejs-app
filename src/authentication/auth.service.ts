@@ -5,7 +5,7 @@ import {
 } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { CustomerService } from 'src/customer/customer.service';
-import { JwtService } from '@nestjs/jwt';
+import { JwtService, JwtSignOptions } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import { randomUUID } from 'crypto';
 import * as argon2 from 'argon2';
@@ -99,13 +99,12 @@ export class AuthService {
     const payload: JwtPayload = { sub: id, email, role };
 
     const [accessToken, refreshToken] = await Promise.all([
+      this.jwtService.signAsync(
+        payload,
+        this.signOptions('JWT_SECRET', 'JWT_EXPIRES_IN'),
+      ),
       this.jwtService.signAsync(payload, {
-        secret: this.configService.get<string>('JWT_SECRET'),
-        expiresIn: this.configService.get<string>('JWT_EXPIRES_IN'),
-      }),
-      this.jwtService.signAsync(payload, {
-        secret: this.configService.get<string>('JWT_REFRESH_SECRET'),
-        expiresIn: this.configService.get<string>('JWT_REFRESH_EXPIRES_IN'),
+        ...this.signOptions('JWT_REFRESH_SECRET', 'JWT_REFRESH_EXPIRES_IN'),
         // Makes every refresh token unique. Without it, two tokens issued in
         // the same second are byte-identical, and rotation could not tell
         // the replaced token from its replacement.
@@ -142,6 +141,16 @@ export class AuthService {
   /** Revokes the customer's refresh token. */
   async logout(customerId: string): Promise<void> {
     await this.customerService.setRefreshTokenHash(customerId, null);
+  }
+
+  private signOptions(secretKey: string, expiresInKey: string) {
+    return {
+      secret: this.configService.getOrThrow<string>(secretKey),
+      // validateEnv has already checked this is a duration such as '15m'.
+      expiresIn: this.configService.getOrThrow<string>(
+        expiresInKey,
+      ) as JwtSignOptions['expiresIn'],
+    };
   }
 
   /** Signs a token pair and records the refresh token as the valid one. */

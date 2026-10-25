@@ -12,6 +12,8 @@ const required = [
   'JWT_REFRESH_EXPIRES_IN',
 ] as const;
 
+const durations = ['JWT_EXPIRES_IN', 'JWT_REFRESH_EXPIRES_IN'] as const;
+
 export function validateEnv(config: Record<string, unknown>) {
   const missing = required.filter((key) => !config[key]);
 
@@ -19,6 +21,19 @@ export function validateEnv(config: Record<string, unknown>) {
     throw new Error(
       `Missing required environment variables: ${missing.join(', ')}. ` +
         'See .env.example.',
+    );
+  }
+
+  // jsonwebtoken reads a bare number as seconds and a string as a duration
+  // ('15m', '7d'). A typo such as '15 mins' is otherwise only reported when
+  // the first token is signed.
+  const badDurations = durations.filter(
+    (key) => !/^\d+(ms|s|m|h|d|w|y)?$/.test(String(config[key])),
+  );
+  if (badDurations.length > 0) {
+    throw new Error(
+      `Invalid duration in ${badDurations.join(', ')}: use a number of ` +
+        "seconds or a value such as '15m' or '7d'.",
     );
   }
 

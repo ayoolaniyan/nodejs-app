@@ -13,11 +13,13 @@ the code inside each handler.
 
 | Concern | Choice |
 | --- | --- |
-| Framework | NestJS 9 |
-| Language | TypeScript |
+| Runtime | Node.js 20 or later |
+| Framework | NestJS 11 |
+| Language | TypeScript 5, `strict` mode |
 | Database | PostgreSQL via Prisma |
-| API | REST (Swagger at `/api`) and GraphQL (Apollo) |
+| API | REST (Swagger at `/api`) and GraphQL (Apollo Server 5) |
 | Auth | Passport JWT, argon2 password hashing |
+| Hardening | helmet, per-IP rate limiting, CORS allow-list |
 | Tests | Jest (unit) and Supertest (HTTP) |
 
 ## Running it
@@ -31,9 +33,14 @@ npm run prisma:seed           # optional: two local accounts
 npm run start:dev
 ```
 
-Swagger UI is served at `http://localhost:8080/api` and the GraphQL
-playground at `http://localhost:8080/graphql`, both disabled when
-`NODE_ENV=production`.
+Swagger UI is served at `http://localhost:8080/api` and GraphiQL at
+`http://localhost:8080/graphql`, both disabled when `NODE_ENV=production`.
+
+`GET /health` returns 200 when the database answers and 503 when it does
+not, for use as a load balancer or container health probe.
+
+Cross-origin browser requests are refused unless the origin is listed in
+`CORS_ORIGINS` (comma-separated).
 
 ## Tests
 
@@ -52,12 +59,17 @@ every push via GitHub Actions.
 
 | Endpoint | Access |
 | --- | --- |
-| `POST /auth/signup` | public |
-| `POST /auth/login` | public |
-| `POST /auth/refresh` | a valid refresh token |
+| `POST /auth/signup` | public, 10 requests per minute per IP |
+| `POST /auth/login` | public, 10 requests per minute per IP |
+| `POST /auth/refresh` | a valid refresh token, 10 requests per minute per IP |
+| `GET /health` | public |
 | `POST /auth/logout`, `GET /auth/me` | any authenticated customer |
 | `GET /customers/:id`, `PATCH /customers/:id` | that customer, or `ADMIN` |
 | `GET /customers`, GraphQL `customers`, `DELETE /customers/:id` | `ADMIN` only |
+
+Every other route is limited to 100 requests per minute per IP. Limits are
+keyed on the connecting address, so behind a reverse proxy Express's
+`trust proxy` setting must be enabled for them to apply per client.
 
 Access and refresh tokens are signed with **different** secrets, and the
 application refuses to start if they are equal, otherwise a refresh token
@@ -108,6 +120,7 @@ prisma/          schema, migrations and seed data
 src/authentication/  controller, service, JWT strategies, role guard
 src/customer/    REST controller, GraphQL resolver, service, DTOs
 src/config/      environment validation
+src/health/      database health check
 src/lib/         shared entities and date helpers
 test/            HTTP-level tests and Jest setup
 ```

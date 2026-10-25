@@ -19,6 +19,15 @@ describe('validateEnv', () => {
     expect(() => validateEnv(incomplete)).toThrow(/JWT_SECRET/);
   });
 
+  it.each(['15 mins', 'forever', '-5m'])(
+    'rejects an expiry that is not a duration (%s)',
+    (value) => {
+      expect(() => validateEnv({ ...valid, JWT_EXPIRES_IN: value })).toThrow(
+        /JWT_EXPIRES_IN/,
+      );
+    },
+  );
+
   it('rejects reusing one secret for both token types', () => {
     expect(() =>
       validateEnv({ ...valid, JWT_REFRESH_SECRET: valid.JWT_SECRET }),

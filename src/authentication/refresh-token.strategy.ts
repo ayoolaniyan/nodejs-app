@@ -16,7 +16,7 @@ export class RefreshTokenStrategy extends PassportStrategy(
   constructor(configService: ConfigService) {
     super({
       jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
-      secretOrKey: configService.get<string>('JWT_REFRESH_SECRET'),
+      secretOrKey: configService.getOrThrow<string>('JWT_REFRESH_SECRET'),
       ignoreExpiration: false,
       // Without this, validate() receives the payload as its first argument
       // and `req` is never passed — the raw token below would be undefined.

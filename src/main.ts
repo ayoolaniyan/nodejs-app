@@ -1,12 +1,33 @@
 import { NestFactory } from '@nestjs/core';
 import { ConfigService } from '@nestjs/config';
-import { ValidationPipe } from '@nestjs/common';
+import { Logger, ValidationPipe } from '@nestjs/common';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
+import helmet from 'helmet';
 import { AppModule } from './app.module';
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule, { cors: true });
+  const app = await NestFactory.create(AppModule);
   const config = app.get(ConfigService);
+  const isProduction = config.get('NODE_ENV') === 'production';
+
+  app.use(
+    helmet({
+      // The default Content-Security-Policy blocks the scripts that Swagger
+      // UI and GraphiQL load, and both are only served outside production.
+      contentSecurityPolicy: isProduction ? undefined : false,
+    }),
+  );
+
+  // Browsers on other origins are refused unless listed. Previously every
+  // origin was allowed.
+  const corsOrigins = config
+    .get<string>('CORS_ORIGINS', '')
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+  if (corsOrigins.length > 0) {
+    app.enableCors({ origin: corsOrigins });
+  }
 
   app.useGlobalPipes(
     new ValidationPipe({
@@ -19,7 +40,7 @@ async function bootstrap() {
     }),
   );
 
-  if (config.get('NODE_ENV') !== 'production') {
+  if (!isProduction) {
     const swaggerConfig = new DocumentBuilder()
       .setTitle('Customer API')
       .setDescription('REST and GraphQL API for customer records')
@@ -34,7 +55,9 @@ async function bootstrap() {
   }
 
   app.enableShutdownHooks();
-  await app.listen(config.get<number>('PORT') ?? 8080);
+  const port = config.get<number>('PORT') ?? 8080;
+  await app.listen(port);
+  Logger.log(`Listening on port ${port}`, 'Bootstrap');
 }
 
-bootstrap();
+void bootstrap();

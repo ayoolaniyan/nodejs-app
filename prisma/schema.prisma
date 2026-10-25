@@ -12,7 +12,7 @@ datasource db {
 }
 
 model Customer {
-  id               String   @id @unique @default(uuid())
+  id               String   @id @default(uuid())
   email            String   @unique
   password         String
   createdAt        DateTime @default(now())

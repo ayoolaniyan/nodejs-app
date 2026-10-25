@@ -11,13 +11,18 @@ type Customer {
   """Date and time when the object was updated last time."""
   updatedAt: Timestamp!
   email: String!
-  role: String!
+  role: Role!
 }
 
 """
 `Date` type as integer. Type represents date and time as number of milliseconds from start of UNIX epoch.
 """
 scalar Timestamp
+
+enum Role {
+  USER
+  ADMIN
+}
 
 type Query {
   customers(input: ListCustomersInput): [Customer!]!

@@ -1,15 +1,20 @@
 import { Module } from '@nestjs/common';
+import { APP_GUARD } from '@nestjs/core';
 import { join } from 'path';
 import { GraphQLModule } from '@nestjs/graphql';
 import { ApolloDriver, ApolloDriverConfig } from '@nestjs/apollo';
 import { ConfigModule } from '@nestjs/config';
+import { ThrottlerModule } from '@nestjs/throttler';
+import { Request } from 'express';
 
-import { AppController } from './app.controller';
-import { AppService } from './app.service';
 import { PrismaModule } from './prisma.module';
 import { CustomerModule } from './customer/customer.module';
 import { AuthModule } from './authentication/auth.module';
+import { HealthModule } from './health/health.module';
 import { validateEnv } from './config/env.validation';
+import { AppThrottlerGuard } from './throttler.guard';
+
+const isProduction = process.env.NODE_ENV === 'production';
 
 @Module({
   imports: [
@@ -18,23 +23,28 @@ import { validateEnv } from './config/env.validation';
       isGlobal: true,
       validate: validateEnv,
     }),
+    // A ceiling for every route, per client IP. The auth endpoints set a
+    // much lower limit of their own.
+    ThrottlerModule.forRoot([{ ttl: 60_000, limit: 100 }]),
     GraphQLModule.forRoot<ApolloDriverConfig>({
       driver: ApolloDriver,
       autoSchemaFile: join(process.cwd(), 'src/schema.gql'),
       buildSchemaOptions: { dateScalarMode: 'timestamp' },
-      // Schema introspection and the playground expose the full API surface,
-      // so they are limited to non-production environments.
-      playground: process.env.NODE_ENV !== 'production',
-      introspection: process.env.NODE_ENV !== 'production',
+      // Schema introspection and the in-browser IDE expose the full API
+      // surface, so they are limited to non-production environments.
+      // GraphiQL replaces the deprecated GraphQL Playground.
+      playground: false,
+      graphiql: !isProduction,
+      introspection: !isProduction,
       // Exposes the HTTP request to resolvers, which is where JwtAuthGuard
       // finds the bearer token.
-      context: ({ req }) => ({ req }),
+      context: ({ req }: { req: Request }) => ({ req }),
     }),
     PrismaModule,
     CustomerModule,
     AuthModule,
+    HealthModule,
   ],
-  controllers: [AppController],
-  providers: [AppService],
+  providers: [{ provide: APP_GUARD, useClass: AppThrottlerGuard }],
 })
 export class AppModule {}
