@@ -5,6 +5,7 @@ import { Role } from './enums/role.enum';
 
 function contextWith(request: Record<string, unknown>): ExecutionContext {
   return {
+    getType: () => 'http',
     getHandler: () => jest.fn(),
     getClass: () => jest.fn(),
     switchToHttp: () => ({ getRequest: () => request }),

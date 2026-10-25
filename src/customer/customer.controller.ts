@@ -1,23 +1,26 @@
 import {
   Body,
   Controller,
-  DefaultValuePipe,
   Delete,
+  ForbiddenException,
   Get,
   NotFoundException,
   Param,
-  ParseIntPipe,
+  ParseUUIDPipe,
   Patch,
   Query,
+  Req,
   UseGuards,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
+import { Request } from 'express';
 import { CustomerService } from './customer.service';
-import { UpdateCustomerInput } from './dto/customer.input';
+import { ListCustomersInput, UpdateCustomerInput } from './dto/customer.input';
 import { JwtAuthGuard } from 'src/authentication/jwt-auth.guard';
 import { RolesGuard } from 'src/authentication/role/roles.guard';
 import { Roles } from 'src/authentication/role/decorators/roles.decorator';
 import { Role } from 'src/authentication/role/enums/role.enum';
+import { AuthenticatedCustomer } from 'src/authentication/auth.service';
 
 @ApiTags('customers')
 @ApiBearerAuth()
@@ -26,12 +29,11 @@ import { Role } from 'src/authentication/role/enums/role.enum';
 export class CustomerController {
   constructor(private readonly customerService: CustomerService) {}
 
+  /** Listing every customer is admin-only; a customer reads their own record. */
+  @Roles(Role.ADMIN)
   @Get()
-  list(
-    @Query('skip', new DefaultValuePipe(0), ParseIntPipe) skip: number,
-    @Query('take', new DefaultValuePipe(25), ParseIntPipe) take: number,
-  ) {
-    return this.customerService.findAll({ skip, take });
+  list(@Query() query: ListCustomersInput) {
+    return this.customerService.findAll(query);
   }
 
   /**
@@ -40,7 +42,11 @@ export class CustomerController {
    * so the identifier belongs in the path.
    */
   @Get(':id')
-  async getOne(@Param('id') id: string) {
+  async getOne(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Req() request: Request,
+  ) {
+    this.assertSelfOrAdmin(request, id);
     const customer = await this.customerService.findById(id);
     if (!customer) {
       throw new NotFoundException(`Customer ${id} not found`);
@@ -49,7 +55,12 @@ export class CustomerController {
   }
 
   @Patch(':id')
-  update(@Param('id') id: string, @Body() data: UpdateCustomerInput) {
+  update(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() data: UpdateCustomerInput,
+    @Req() request: Request,
+  ) {
+    this.assertSelfOrAdmin(request, id);
     return this.customerService.updateById(id, data);
   }
 
@@ -59,7 +70,18 @@ export class CustomerController {
    */
   @Roles(Role.ADMIN)
   @Delete(':id')
-  remove(@Param('id') id: string) {
+  remove(@Param('id', ParseUUIDPipe) id: string) {
     return this.customerService.deleteById(id);
+  }
+
+  /**
+   * A customer may only act on their own record; an admin may act on any.
+   * Without this, any logged-in customer could read or rewrite another's.
+   */
+  private assertSelfOrAdmin(request: Request, id: string) {
+    const caller = request.user as AuthenticatedCustomer;
+    if (caller.role !== Role.ADMIN && caller.id !== id) {
+      throw new ForbiddenException();
+    }
   }
 }

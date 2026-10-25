@@ -1,17 +1,24 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import {
+  ConflictException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaClientKnownRequestError } from '@prisma/client/runtime/library';
 import { PrismaService } from 'src/prisma.service';
 import { UpdateCustomerInput } from './dto/customer.input';
 
-/** Columns returned to callers — the password hash is never among them. */
-const publicCustomerFields: Prisma.CustomerSelect = {
+/**
+ * Columns returned to callers — the password hash and refresh token hash are
+ * never among them.
+ */
+const publicCustomerFields = {
   id: true,
   email: true,
   role: true,
   createdAt: true,
   updatedAt: true,
-};
+} satisfies Prisma.CustomerSelect;
 
 @Injectable()
 export class CustomerService {
@@ -45,8 +52,24 @@ export class CustomerService {
     });
   }
 
-  create(data: Prisma.CustomerCreateInput) {
-    return this.prisma.customer.create({ data });
+  /**
+   * Returns the full record including both hashes. Only the authentication
+   * layer should call this.
+   */
+  findAuthRecordById(id: string) {
+    return this.prisma.customer.findUnique({ where: { id } });
+  }
+
+  async create(data: Prisma.CustomerCreateInput) {
+    try {
+      return await this.prisma.customer.create({ data });
+    } catch (error) {
+      // Reached when two signups for one email race past the existence check
+      // in AuthService.signup; worded the same as that check.
+      throw this.translatePrismaError(error, {
+        conflict: 'Unable to create account',
+      });
+    }
   }
 
   async updateById(id: string, data: UpdateCustomerInput) {
@@ -57,7 +80,10 @@ export class CustomerService {
         select: publicCustomerFields,
       });
     } catch (error) {
-      throw this.translatePrismaError(error, id);
+      throw this.translatePrismaError(error, {
+        notFound: `Customer ${id} not found`,
+        conflict: 'Email is already in use',
+      });
     }
   }
 
@@ -68,21 +94,39 @@ export class CustomerService {
         select: publicCustomerFields,
       });
     } catch (error) {
-      throw this.translatePrismaError(error, id);
+      throw this.translatePrismaError(error, {
+        notFound: `Customer ${id} not found`,
+      });
     }
   }
 
+  /** Stores the hash of the customer's current refresh token, or clears it. */
+  async setRefreshTokenHash(id: string, refreshTokenHash: string | null) {
+    await this.prisma.customer.update({
+      where: { id },
+      data: { refreshTokenHash },
+    });
+  }
+
   /**
-   * Prisma reports a missing row as P2025. Previously this surfaced as a
-   * 403 "Credentials incorrect", which is neither the right status nor an
-   * accurate description of what happened.
+   * Maps the Prisma errors a caller can cause to HTTP errors; anything else
+   * is passed through and surfaces as a 500.
+   *
+   * P2025 is a missing row. P2002 is a unique constraint violation, and email
+   * is the only unique column a caller can write, so it means the email is
+   * taken. Previously both surfaced as 500s.
    */
-  private translatePrismaError(error: unknown, id: string): unknown {
-    if (
-      error instanceof PrismaClientKnownRequestError &&
-      error.code === 'P2025'
-    ) {
-      return new NotFoundException(`Customer ${id} not found`);
+  private translatePrismaError(
+    error: unknown,
+    messages: { notFound?: string; conflict?: string },
+  ): unknown {
+    if (error instanceof PrismaClientKnownRequestError) {
+      if (error.code === 'P2025' && messages.notFound) {
+        return new NotFoundException(messages.notFound);
+      }
+      if (error.code === 'P2002' && messages.conflict) {
+        return new ConflictException(messages.conflict);
+      }
     }
     return error;
   }

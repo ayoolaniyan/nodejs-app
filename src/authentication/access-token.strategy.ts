@@ -23,9 +23,7 @@ export class AccessTokenStrategy extends PassportStrategy(Strategy, 'jwt') {
    * an account was deleted or its role changed does not keep working.
    */
   async validate(payload: JwtPayload) {
-    const customer = await this.authService.validateCustomer({
-      email: payload.email,
-    });
+    const customer = await this.authService.validateCustomer(payload.sub);
     if (!customer) {
       throw new UnauthorizedException();
     }

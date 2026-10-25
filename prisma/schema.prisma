@@ -12,12 +12,15 @@ datasource db {
 }
 
 model Customer {
-  id        String   @id @unique @default(uuid())
-  email     String   @unique
-  password  String
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-  role      Role     @default(USER)
+  id               String   @id @unique @default(uuid())
+  email            String   @unique
+  password         String
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+  role             Role     @default(USER)
+  // argon2 hash of the one refresh token currently valid for this customer.
+  // Null once they log out. Never selected into API responses.
+  refreshTokenHash String?
 }
 
 enum Role {
