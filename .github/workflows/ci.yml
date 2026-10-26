@@ -41,13 +41,18 @@ jobs:
   integration:
     name: Docker image against PostgreSQL
     runs-on: ubuntu-latest
-    env:
-      # Throwaway values for this job only.
-      JWT_SECRET: ci-access-secret
-      JWT_REFRESH_SECRET: ci-refresh-secret
-
     steps:
       - uses: actions/checkout@v7
+
+      # Fresh random values on every run, so no credential is written into
+      # the repository. Masked in the job log.
+      - name: Generate throwaway credentials
+        run: |
+          for name in POSTGRES_PASSWORD JWT_SECRET JWT_REFRESH_SECRET; do
+            value=$(openssl rand -hex 24)
+            echo "::add-mask::$value"
+            echo "$name=$value" >> "$GITHUB_ENV"
+          done
 
       - uses: actions/setup-node@v7
         with:
@@ -68,7 +73,7 @@ jobs:
           npx prisma migrate diff \
             --from-migrations prisma/migrations \
             --to-schema-datamodel prisma/schema.prisma \
-            --shadow-database-url "postgresql://postgres:postgres@localhost:5432/customers?schema=shadow" \
+            --shadow-database-url "postgresql://postgres:${POSTGRES_PASSWORD}@localhost:5432/customers?schema=shadow" \
             --exit-code
 
       - if: failure()

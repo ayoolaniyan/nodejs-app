@@ -21,6 +21,9 @@ const isProduction = process.env.NODE_ENV === 'production';
     // First, so that every other module's factory can read configuration.
     ConfigModule.forRoot({
       isGlobal: true,
+      // Lets .env build DATABASE_URL from POSTGRES_PASSWORD, as the Prisma
+      // CLI and Docker Compose already do.
+      expandVariables: true,
       validate: validateEnv,
     }),
     // A ceiling for every route, per client IP. The auth endpoints set a

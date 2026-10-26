@@ -26,13 +26,18 @@ the code inside each handler.
 
 ## Running it
 
-Generate the two JWT secrets first; the API refuses to start without them.
+Create `.env` and fill in three generated values: `POSTGRES_PASSWORD`, and
+two different JWT secrets. No credential is committed to the repository;
+the database URLs in `.env` refer to `POSTGRES_PASSWORD`, so it is set once.
 
 ```bash
 cp .env.example .env
-# set JWT_SECRET and JWT_REFRESH_SECRET to two different values from:
-node -e "console.log(require('crypto').randomBytes(48).toString('base64url'))"
+# one value per variable:
+node -e "console.log(require('crypto').randomBytes(24).toString('hex'))"
 ```
+
+Compose refuses to start without `POSTGRES_PASSWORD`. The API refuses to
+start without the JWT secrets, naming whichever is missing.
 
 **Everything in Docker.** PostgreSQL, the migrations and the production
 image of the API:

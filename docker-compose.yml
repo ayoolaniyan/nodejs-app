@@ -3,19 +3,21 @@
 #   docker compose up --build        everything, API on http://localhost:8080
 #   docker compose up -d db          just the database, for `npm run start:dev`
 #
-# The API reads its JWT secrets from .env (see .env.example) and exits at
-# startup, naming the missing variable, if they are not set. They are not
-# required here, so that `docker compose up -d db` works without them.
+# Configuration comes from .env (see .env.example). POSTGRES_PASSWORD is
+# required for every command, including `up -d db`. The JWT secrets are
+# checked by the API itself, which exits naming any that are missing, so
+# the database can be started without them.
 
 services:
   db:
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: customers
     ports:
-      - '5432:5432'
+      # Reachable from this machine only.
+      - '127.0.0.1:5432:5432'
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -31,7 +33,7 @@ services:
       target: build
     command: ['npx', 'prisma', 'migrate', 'deploy']
     environment:
-      DATABASE_URL: postgresql://postgres:postgres@db:5432/customers?schema=public
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@db:5432/customers?schema=public
     depends_on:
       db:
         condition: service_healthy
@@ -44,7 +46,7 @@ services:
       - '8080:8080'
     environment:
       PORT: 8080
-      DATABASE_URL: postgresql://postgres:postgres@db:5432/customers?schema=public
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@db:5432/customers?schema=public
       JWT_SECRET: ${JWT_SECRET:-}
       JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:-}
       JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-15m}
