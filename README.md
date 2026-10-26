@@ -1,5 +1,7 @@
 # nodejs-app
 
+[![CI](https://github.com/ayoolaniyan/nodejs-app/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ayoolaniyan/nodejs-app/actions/workflows/ci.yml)
+
 A NestJS service exposing customer records over both REST and GraphQL, with
 JWT authentication, role-based authorisation and Prisma/PostgreSQL
 persistence.
@@ -24,11 +26,28 @@ the code inside each handler.
 
 ## Running it
 
+Generate the two JWT secrets first; the API refuses to start without them.
+
 ```bash
-cp .env.example .env          # then fill in the two JWT secrets
+cp .env.example .env
+# set JWT_SECRET and JWT_REFRESH_SECRET to two different values from:
+node -e "console.log(require('crypto').randomBytes(48).toString('base64url'))"
+```
+
+**Everything in Docker.** PostgreSQL, the migrations and the production
+image of the API:
+
+```bash
+docker compose up --build     # API on http://localhost:8080
+```
+
+**API on the host, database in Docker**, with hot reload:
+
+```bash
+docker compose up -d db
 npm install
 npm run prisma:generate
-npm run prisma:migrate        # requires a reachable PostgreSQL
+npm run prisma:migrate
 npm run prisma:seed           # optional: two local accounts
 npm run start:dev
 ```
@@ -45,15 +64,26 @@ Cross-origin browser requests are refused unless the origin is listed in
 ## Tests
 
 ```bash
-npm test        # unit tests
-npm run test:e2e   # HTTP-level tests, no database required
+npm test            # unit tests
+npm run test:e2e    # HTTP-level tests, no database required
+npm run test:cov    # both, with coverage thresholds
 npm run lint
 npm run typecheck
+
+# against a running stack (docker compose up), with a real PostgreSQL
+node scripts/smoke-test.mjs
 ```
 
-The e2e suite substitutes an in-memory double for the persistence layer, so
-it runs in CI without a PostgreSQL service container. Both suites run on
-every push via GitHub Actions.
+The unit and e2e suites substitute an in-memory double for the database,
+so they run in seconds and need no services. Together they cover about 98%
+of statements; CI fails below the thresholds in `test/jest-coverage.json`.
+
+What a double cannot prove is checked by a second CI job, which builds the
+production Docker image, applies every migration to an empty PostgreSQL,
+and runs `scripts/smoke-test.mjs` against it, including concurrent
+duplicate signups that only the database's unique index can catch. The
+same job fails if `schema.prisma` has changed without a matching
+migration. Both jobs run on every push and pull request.
 
 ## Authentication model
 
@@ -123,7 +153,28 @@ src/config/      environment validation
 src/health/      database health check
 src/lib/         shared entities and date helpers
 test/            HTTP-level tests and Jest setup
+scripts/         smoke test for a running instance
 ```
+
+## Known limitations and next steps
+
+- **Signup reveals registered emails.** It has to return 409 for an
+  existing address. Fixing that properly means an email-verification flow
+  that answers every signup the same way.
+- **Access tokens cannot be revoked.** Logout revokes the refresh token,
+  but an access token stays valid until it expires. Keep `JWT_EXPIRES_IN`
+  short, or add a token denylist if immediate revocation matters.
+- **One refresh token per customer.** Logging in on a second device
+  replaces the first device's refresh token. Per-device sessions would need
+  a sessions table.
+- **Rate limits are per process and in memory.** With several instances,
+  or after a restart, the counts are not shared. A Redis-backed throttler
+  storage fixes both.
+- **No password reset or email change verification.** Changing the email
+  on an account takes effect immediately, without confirming the new
+  address.
+- **Customer lists use offset pagination**, which slows down on large
+  tables. Cursor pagination on `createdAt` and `id` would scale better.
 
 ## Licence
 
