@@ -13,13 +13,25 @@ function prismaError(code: string) {
 describe('CustomerService', () => {
   const id = 'ff1b0c1e-0000-4000-8000-000000000001';
   let prisma: {
-    customer: { create: jest.Mock; update: jest.Mock; delete: jest.Mock };
+    customer: {
+      findMany: jest.Mock;
+      findUnique: jest.Mock;
+      create: jest.Mock;
+      update: jest.Mock;
+      delete: jest.Mock;
+    };
   };
   let service: CustomerService;
 
   beforeEach(() => {
     prisma = {
-      customer: { create: jest.fn(), update: jest.fn(), delete: jest.fn() },
+      customer: {
+        findMany: jest.fn(),
+        findUnique: jest.fn(),
+        create: jest.fn(),
+        update: jest.fn(),
+        delete: jest.fn(),
+      },
     };
     service = new CustomerService(prisma as unknown as PrismaService);
   });
@@ -67,6 +79,39 @@ describe('CustomerService', () => {
     await service.updateById(id, {});
 
     const { select } = prisma.customer.update.mock.calls[0][0];
+    expect(select).not.toHaveProperty('password');
+    expect(select).not.toHaveProperty('refreshTokenHash');
+  });
+
+  describe('findAll', () => {
+    it('defaults to the first 25 customers, newest first', async () => {
+      await service.findAll();
+
+      expect(prisma.customer.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          skip: 0,
+          take: 25,
+          orderBy: { createdAt: 'desc' },
+        }),
+      );
+    });
+
+    it('never fetches more than 100 rows, whatever the caller asks for', async () => {
+      // The REST and GraphQL inputs also cap take at 100; this is the
+      // backstop for any future caller that skips them.
+      await service.findAll({ take: 10_000 });
+
+      expect(prisma.customer.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ take: 100 }),
+      );
+    });
+  });
+
+  it('reads a single customer without either hash', async () => {
+    await service.findById(id);
+
+    const { where, select } = prisma.customer.findUnique.mock.calls[0][0];
+    expect(where).toEqual({ id });
     expect(select).not.toHaveProperty('password');
     expect(select).not.toHaveProperty('refreshTokenHash');
   });

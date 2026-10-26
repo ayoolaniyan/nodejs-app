@@ -190,10 +190,47 @@ describe('Customers (e2e)', () => {
       await get('/customers/not-a-uuid', admin).expect(400);
     });
 
+    it('returns 404 for a customer that does not exist', async () => {
+      await get(
+        '/customers/ff1b0c1e-0000-4000-8000-0000000000ff',
+        admin,
+      ).expect(404);
+    });
+
+    it('lets an admin delete a customer', async () => {
+      customerService.deleteById.mockResolvedValue(bob);
+
+      await request(app.getHttpServer())
+        .delete(`/customers/${bob.id}`)
+        .set('Authorization', `Bearer ${tokenFor(admin)}`)
+        .expect(200);
+      expect(customerService.deleteById).toHaveBeenCalledWith(bob.id);
+    });
+
+    it('forbids a customer from deleting, even their own record', async () => {
+      await request(app.getHttpServer())
+        .delete(`/customers/${alice.id}`)
+        .set('Authorization', `Bearer ${tokenFor(alice)}`)
+        .expect(403);
+      expect(customerService.deleteById).not.toHaveBeenCalled();
+    });
+
     it('requires a token', async () => {
       await request(app.getHttpServer())
         .get(`/customers/${alice.id}`)
         .expect(401);
+    });
+
+    it('rejects a valid token once its customer has been deleted', async () => {
+      // The signature and expiry are fine; the strategy re-reads the
+      // customer on every request, so deletion takes effect immediately.
+      const deleted = {
+        id: 'ff1b0c1e-0000-4000-8000-0000000000dd',
+        email: 'deleted@example.com',
+        role: 'USER',
+      };
+
+      await get(`/customers/${deleted.id}`, deleted).expect(401);
     });
   });
 

@@ -67,4 +67,27 @@ describe('datesMatch', () => {
     expect(datesMatch(date1, date2, TimeUnit.Year)).toBe(true);
     expect(datesMatch(date1, date3, TimeUnit.Year)).toBe(false);
   });
+
+  test('treats calendar boundaries, not elapsed time, as the bucket edge', () => {
+    // Two minutes apart, but on different days and in different years.
+    const lastMinuteOfYear = new Date('2023-12-31T23:59:00Z');
+    const firstMinuteOfYear = new Date('2024-01-01T00:01:00Z');
+
+    expect(datesMatch(lastMinuteOfYear, firstMinuteOfYear, TimeUnit.Day)).toBe(
+      false,
+    );
+    expect(datesMatch(lastMinuteOfYear, firstMinuteOfYear, TimeUnit.Year)).toBe(
+      false,
+    );
+    // 2023-12-31 is a Sunday and 2024-01-01 a Monday: different ISO weeks.
+    expect(datesMatch(lastMinuteOfYear, firstMinuteOfYear, TimeUnit.Week)).toBe(
+      false,
+    );
+  });
+
+  test('rejects an invalid Date rather than comparing NaN', () => {
+    expect(() =>
+      datesMatch(new Date('not a date'), new Date(), TimeUnit.Day),
+    ).toThrow(TypeError);
+  });
 });
