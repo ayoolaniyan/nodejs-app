@@ -3,8 +3,9 @@
 #   docker compose up --build        everything, API on http://localhost:8080
 #   docker compose up -d db          just the database, for `npm run start:dev`
 #
-# JWT secrets are read from .env (see .env.example); Compose refuses to start
-# if they are missing.
+# The API reads its JWT secrets from .env (see .env.example) and exits at
+# startup, naming the missing variable, if they are not set. They are not
+# required here, so that `docker compose up -d db` works without them.
 
 services:
   db:
@@ -44,8 +45,8 @@ services:
     environment:
       PORT: 8080
       DATABASE_URL: postgresql://postgres:postgres@db:5432/customers?schema=public
-      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
-      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?set JWT_REFRESH_SECRET in .env}
+      JWT_SECRET: ${JWT_SECRET:-}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:-}
       JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-15m}
       JWT_REFRESH_EXPIRES_IN: ${JWT_REFRESH_EXPIRES_IN:-7d}
       CORS_ORIGINS: ${CORS_ORIGINS:-}
