@@ -5,13 +5,14 @@ on:
   pull_request:
 
 jobs:
-  build:
+  test:
+    name: Lint, typecheck and tests
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -26,6 +27,52 @@ jobs:
 
       - run: npm run typecheck
 
-      - run: npm test
+      # Unit and e2e suites together, failing below the thresholds in
+      # test/jest-coverage.json.
+      - run: npm run test:cov
 
-      - run: npm run test:e2e
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: coverage
+          path: coverage/lcov-report
+          retention-days: 14
+
+  integration:
+    name: Docker image against PostgreSQL
+    runs-on: ubuntu-latest
+    env:
+      # Throwaway values for this job only.
+      JWT_SECRET: ci-access-secret
+      JWT_REFRESH_SECRET: ci-refresh-secret
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      # Builds the production image, applies every migration to an empty
+      # PostgreSQL and starts the API, exactly as `docker compose up` does
+      # locally.
+      - run: docker compose up --build --detach
+
+      - run: node scripts/smoke-test.mjs http://localhost:8080
+
+      # Fails if schema.prisma has changed without a matching migration.
+      - name: Check migrations match schema.prisma
+        run: |
+          npm ci
+          npx prisma migrate diff \
+            --from-migrations prisma/migrations \
+            --to-schema-datamodel prisma/schema.prisma \
+            --shadow-database-url "postgresql://postgres:postgres@localhost:5432/customers?schema=shadow" \
+            --exit-code
+
+      - if: failure()
+        run: docker compose logs
+
+      - if: always()
+        run: docker compose down --volumes
