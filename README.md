@@ -1,6 +1,6 @@
-# nodejs-app
+# nestjs-customer-api
 
-[![CI](https://github.com/ayoolaniyan/nodejs-app/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ayoolaniyan/nodejs-app/actions/workflows/ci.yml)
+[![CI](https://github.com/ayoolaniyan/nestjs-customer-api/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ayoolaniyan/nestjs-customer-api/actions/workflows/ci.yml)
 
 A NestJS service exposing customer records over both REST and GraphQL, with
 JWT authentication, role-based authorisation and Prisma/PostgreSQL

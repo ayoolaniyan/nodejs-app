@@ -1,5 +1,5 @@
 {
-  "name": "nodejs-app",
+  "name": "nestjs-customer-api",
   "version": "1.0.0",
   "description": "NestJS customer API with Prisma, GraphQL and JWT authentication",
   "license": "MIT",
