@@ -138,6 +138,35 @@ describe('Auth (e2e)', () => {
     expect(customerService.create).not.toHaveBeenCalled();
   });
 
+  it('signs up a new customer and returns both tokens', async () => {
+    customerService.findCustomerEmail.mockResolvedValue(null);
+    customerService.create.mockImplementation(
+      async (data: { email: string; password: string }) => ({
+        ...customer,
+        ...data,
+      }),
+    );
+
+    const response = await request(app.getHttpServer())
+      .post('/auth/signup')
+      .send({ email: 'new@example.com', password })
+      .expect(201);
+
+    expect(response.body).toEqual({
+      access_token: expect.any(String),
+      refresh_token: expect.any(String),
+    });
+  });
+
+  it('rejects a signup password shorter than 12 characters', async () => {
+    await request(app.getHttpServer())
+      .post('/auth/signup')
+      .send({ email: 'new@example.com', password: 'short' })
+      .expect(400);
+
+    expect(customerService.create).not.toHaveBeenCalled();
+  });
+
   it('requires a bearer token on /auth/me', async () => {
     await request(app.getHttpServer()).get('/auth/me').expect(401);
   });

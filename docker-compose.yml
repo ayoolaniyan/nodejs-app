@@ -1,0 +1,61 @@
+# Local stack: PostgreSQL, a one-off migration job, and the API.
+#
+#   docker compose up --build        everything, API on http://localhost:8080
+#   docker compose up -d db          just the database, for `npm run start:dev`
+#
+# Configuration comes from .env (see .env.example). POSTGRES_PASSWORD is
+# required for every command, including `up -d db`. The JWT secrets are
+# checked by the API itself, which exits naming any that are missing, so
+# the database can be started without them.
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      # Required: Compose stops with an error naming it if .env lacks it.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
+      POSTGRES_DB: customers
+    ports:
+      # Reachable from this machine only.
+      - '127.0.0.1:5432:5432'
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d customers']
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  # Applies prisma/migrations, then exits. The API waits for it to succeed.
+  migrate:
+    build:
+      context: .
+      target: build
+    command: ['npx', 'prisma', 'migrate', 'deploy']
+    environment:
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@db:5432/customers?schema=public
+    depends_on:
+      db:
+        condition: service_healthy
+
+  api:
+    build:
+      context: .
+      target: runtime
+    ports:
+      - '8080:8080'
+    environment:
+      PORT: 8080
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@db:5432/customers?schema=public
+      JWT_SECRET: ${JWT_SECRET:-}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:-}
+      JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-15m}
+      JWT_REFRESH_EXPIRES_IN: ${JWT_REFRESH_EXPIRES_IN:-7d}
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  pgdata:

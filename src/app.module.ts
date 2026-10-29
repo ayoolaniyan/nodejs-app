@@ -21,6 +21,9 @@ const isProduction = process.env.NODE_ENV === 'production';
     // First, so that every other module's factory can read configuration.
     ConfigModule.forRoot({
       isGlobal: true,
+      // Lets .env build DATABASE_URL from POSTGRES_PASSWORD, as the Prisma
+      // CLI and Docker Compose already do.
+      expandVariables: true,
       validate: validateEnv,
     }),
     // A ceiling for every route, per client IP. The auth endpoints set a
@@ -28,7 +31,13 @@ const isProduction = process.env.NODE_ENV === 'production';
     ThrottlerModule.forRoot([{ ttl: 60_000, limit: 100 }]),
     GraphQLModule.forRoot<ApolloDriverConfig>({
       driver: ApolloDriver,
-      autoSchemaFile: join(process.cwd(), 'src/schema.gql'),
+      // Written to disk during development so schema changes show up in
+      // review. In production the schema is built in memory: the app must
+      // not write into its own install directory, which a hardened
+      // container mounts read-only.
+      autoSchemaFile: isProduction
+        ? true
+        : join(process.cwd(), 'src/schema.gql'),
       buildSchemaOptions: { dateScalarMode: 'timestamp' },
       // Schema introspection and the in-browser IDE expose the full API
       // surface, so they are limited to non-production environments.
